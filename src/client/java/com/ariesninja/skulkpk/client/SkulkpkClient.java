@@ -1,13 +1,11 @@
 package com.ariesninja.skulkpk.client;
 
 import com.ariesninja.skulkpk.client.core.*;
-import com.ariesninja.skulkpk.client.core.physics.utils.Ledge;
 import com.ariesninja.skulkpk.client.core.rendering.SelectionRenderer;
 import com.ariesninja.skulkpk.client.core.utils.ModStateManager;
 import com.ariesninja.skulkpk.client.license.LicenseInputScreen;
 import com.ariesninja.skulkpk.client.license.LicenseManager;
 import com.ariesninja.skulkpk.client.license.LicenseVerificationService;
-import com.ariesninja.skulkpk.client.pk.AutoJumpHelper;
 import com.ariesninja.skulkpk.client.core.utils.ChatMessageUtil;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
@@ -35,15 +33,27 @@ public class SkulkpkClient implements ClientModInitializer {
             }
             verifyLicenseOnServerJoin(client);
         });
+        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
+            StepExecutor.getInstance().cancel(client, "Disconnected from world.");
+            BlockSelector.clearSelectionSilent();
+        });
     }
 
     private void onClientTick(MinecraftClient client) {
         // Check if mod is disabled before processing any functionality
         if (!ModStateManager.isModEnabled()) {
+            StepExecutor.getInstance().cancel(client, "Mod disabled.");
+            BlockSelector.clearSelectionSilent();
             return;
         }
 
         if (Keybinds.SELECT_KEY.wasPressed()) {
+            if (StepExecutor.getInstance().isPlanning()) {
+                StepExecutor.getInstance().cancel(client, "Planning cancelled for a new selection.");
+            } else if (StepExecutor.getInstance().isExecuting()) {
+                ChatMessageUtil.sendWarn(client, "Cancel the active jump before selecting another target.");
+                return;
+            }
             var cameraEntity = client.getCameraEntity();
             if (cameraEntity == null) return;
 
@@ -84,30 +94,11 @@ public class SkulkpkClient implements ClientModInitializer {
             }
 
             // Stop execution if active
-            if (StepExecutor.getInstance().isExecuting()) {
-                StepExecutor.getInstance().stopExecution();
-            }
+            StepExecutor.getInstance().cancel(client, "Sequence execution cancelled.");
         }
-
-//        if (Keybinds.TEST_KEY_1.wasPressed()) {
-//            // This key can be used for testing purposes, e.g., to trigger a specific action or log information
-//            PlayerController.cvmRotatePlayer(client);
-//        }
-//
-//        if (Keybinds.TEST_KEY_2.wasPressed()) {
-//            PlayerController.cvmMovePlayer(client);
-//        }
-//
-//        // Debug key to log AutoJumpHelper value when held
-//        if (Keybinds.DEBUG_AUTOJUMP_KEY.isPressed() && client.player != null) {
-//            boolean state0 = AutoJumpHelper.INSTANCE.shouldAutoJump(client.player, client);
-//            boolean state1 = Ledge.shouldAutoJump(0.001);
-//            System.out.println("state0: " + state0 + ", state1: " + state1);
-//        }
 
         // Call tick methods for ongoing execution
         StepExecutor.getInstance().tick(client);
-        PlayerController.tick(client);
     }
 
     private void verifyLicenseOnServerJoin(MinecraftClient client) {

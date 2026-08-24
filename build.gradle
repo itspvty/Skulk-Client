@@ -36,6 +36,10 @@ sourceSets {
             srcDirs += 'src/client/kotlin'
         }
     }
+    test {
+        compileClasspath += sourceSets.client.output + sourceSets.client.compileClasspath
+        runtimeClasspath += sourceSets.client.output + sourceSets.client.runtimeClasspath
+    }
 }
 
 fabricApi {
@@ -62,18 +66,29 @@ dependencies {
     modImplementation("net.fabricmc:fabric-language-kotlin:1.13.1+kotlin.2.1.10")
 
     include modImplementation("io.github.0x3c50.renderer:renderer-fabric:1.2.5")
+
+    testImplementation "org.junit.jupiter:junit-jupiter:5.11.4"
+    testRuntimeOnly "org.junit.platform:junit-platform-launcher"
 }
 
+tasks.withType(Test).configureEach {
+    useJUnitPlatform()
+}
+
+def expandedModVersion = project.version
+def expandedMinecraftVersion = project.minecraft_version
+def expandedLoaderVersion = project.loader_version
+
 processResources {
-    inputs.property "version", project.version
-    inputs.property "minecraft_version", project.minecraft_version
-    inputs.property "loader_version", project.loader_version
-    filteringCharset "UTF-8"
+    inputs.property "version", expandedModVersion
+    inputs.property "minecraft_version", expandedMinecraftVersion
+    inputs.property "loader_version", expandedLoaderVersion
+    filteringCharset = "UTF-8"
 
     filesMatching("fabric.mod.json") {
-        expand "version": project.version,
-                "minecraft_version": project.minecraft_version,
-                "loader_version": project.loader_version
+        expand "version": expandedModVersion,
+                "minecraft_version": expandedMinecraftVersion,
+                "loader_version": expandedLoaderVersion
     }
 }
 
