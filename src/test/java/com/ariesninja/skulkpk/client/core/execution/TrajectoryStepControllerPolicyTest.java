@@ -10,12 +10,23 @@ import com.ariesninja.skulkpk.client.core.physics.InMemoryPhysicsWorld;
 import com.ariesninja.skulkpk.client.core.planning.SupportKind;
 import com.ariesninja.skulkpk.client.core.planning.TrajectorySample;
 import net.minecraft.util.math.Box;
+import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 class TrajectoryStepControllerPolicyTest {
+    @Test void takeoffRequiresAnObservedUpwardTransitionRatherThanAnyAirborneState() {
+        assertFalse(TrajectoryStepController.isTakeoffConfirmed(false, -0.02, -0.08),
+                "Walking off an edge must not masquerade as a jump.");
+        assertFalse(TrajectoryStepController.isTakeoffConfirmed(true, 0, 0));
+        assertTrue(TrajectoryStepController.isTakeoffConfirmed(false, 0.18, -0.08),
+                "A headhitter can confirm from upward displacement after its velocity is clipped.");
+        assertTrue(TrajectoryStepController.isTakeoffConfirmed(false, 0, -0.08, true),
+                "An immediate upward collision still acknowledges the jump command.");
+        assertTrue(TrajectoryStepController.isTakeoffConfirmed(false, 0, 0.33));
+    }
     @Test void launchFramesWaitForTightYawAlignment() {
         assertTrue(TrajectoryStepController.isLaunchYawAligned(2));
         assertTrue(TrajectoryStepController.isLaunchYawAligned(-2));
@@ -102,5 +113,55 @@ class TrajectoryStepControllerPolicyTest {
                 java.util.Map.of());
 
         assertEquals(planned, controller.selectAirborneControl(observed, planned, 0));
+    }
+
+    @Test void takeoffUsesAStableRolloutInsteadOfExactSampleError() {
+        InMemoryPhysicsWorld world = new InMemoryPhysicsWorld();
+        java.util.List<com.ariesninja.skulkpk.client.core.analysis.StandableSurface> takeoffs =
+                new java.util.ArrayList<>();
+        for (int x = -2; x <= 0; x++) {
+            world.floor(x, 0, 0);
+            takeoffs.add(new com.ariesninja.skulkpk.client.core.analysis.StandableSurface(
+                    new BlockPos(x, -1, 0), new Box(x, -1, 0, x + 1, 0, 1), 0));
+        }
+        world.floor(2, 0, 0);
+        var landing = new com.ariesninja.skulkpk.client.core.analysis.StandableSurface(
+                new BlockPos(2, -1, 0), new Box(2, -1, 0, 3, 0, 1), 0);
+        Vec3d feet = new Vec3d(-0.5, 0, 0.5);
+        var player = new com.ariesninja.skulkpk.client.core.analysis.PlayerSnapshot(feet,
+                new Box(-0.8, 0, 0.2, -0.2, 1.8, 0.8), Vec3d.ZERO, -90,
+                true, false, false, 0.1, 0.42, 0.6, java.util.Map.of());
+        var problem = new com.ariesninja.skulkpk.client.core.analysis.JumpProblem(landing.block(),
+                takeoffs.getLast(), java.util.List.of(landing), takeoffs, world.boxes(), player, 11);
+        var request = new com.ariesninja.skulkpk.client.core.planning.PlanningRequest(world, player,
+                landing.block(), com.ariesninja.skulkpk.client.core.planning.PlanningPolicy.AGGRESSIVE,
+                problem);
+        var session = new com.ariesninja.skulkpk.client.core.planning.SearchPlanningSession(request);
+        com.ariesninja.skulkpk.client.core.planning.PlanningTickResult result = null;
+        for (int tick = 0; tick < 1000; tick++) {
+            result = session.tick(100_000_000L);
+            if (!(result instanceof com.ariesninja.skulkpk.client.core.planning.PlanningTickResult.Planning)) break;
+        }
+        MovementPlan plan = assertInstanceOf(
+                com.ariesninja.skulkpk.client.core.planning.PlanningTickResult.Ready.class, result).plan();
+        int jumpIndex = 0;
+        while (!plan.controlFrames().get(jumpIndex).jump()) jumpIndex++;
+        ControlFrame jump = plan.controlFrames().get(jumpIndex);
+        TrajectorySample expected = plan.predictedTrajectory().get(jumpIndex);
+        ParkourState exact = new ParkourState(expected.feetPosition(), expected.velocity(),
+                expected.boundingBox(), jump.desiredYaw(), true, jump.sprint(), false,
+                false, false, jumpIndex, 0.1, 0.42, 0.6, java.util.Map.of());
+        ParkourState lagged = new ParkourState(expected.feetPosition().subtract(
+                plan.launchLane().heading().multiply(0.12)), expected.velocity().multiply(0.65),
+                expected.boundingBox().offset(plan.launchLane().heading().multiply(-0.12)),
+                jump.desiredYaw(), true, jump.sprint(), false, false, false,
+                jumpIndex, 0.1, 0.42, 0.6, java.util.Map.of());
+        TrajectoryStepController controller = new TrajectoryStepController();
+        controller.start(plan, world);
+
+        assertEquals(TrajectoryStepController.TakeoffDecision.JUMP_NOW,
+                controller.takeoffDecision(exact, jump, jumpIndex));
+        assertNotEquals(TrajectoryStepController.TakeoffDecision.ABORT,
+                controller.takeoffDecision(lagged, jump, jumpIndex));
     }
 }

@@ -9,7 +9,7 @@ import java.util.*;
 
 /** Converts a selected collision surface and exact player state into bounded search geometry. */
 public final class JumpAnalyzer {
-    static final double MAX_HORIZONTAL_EDGE_DISTANCE = 4.3;
+    static final double MAX_LEVEL_OR_UPWARD_EDGE_DISTANCE = 4.3;
 
     public JumpProblemResult analyzeProblem(WorldView world, PlayerSnapshot player, BlockPos selectedBlock) {
         StandableSurface standing = findStandingSurface(world, player);
@@ -30,26 +30,52 @@ public final class JumpAnalyzer {
             return rejected(JumpRejectionReason.NO_JUMP_REQUIRED,
                     "The selected target is reachable without a jump.");
         }
-        if (walkingRegion.stream().noneMatch(takeoff -> selectedLanding.topY() - takeoff.topY() <= 1.0001)) {
-            return rejected(JumpRejectionReason.TOO_HIGH,
-                    "Every reachable takeoff is more than one block below the landing.");
-        }
-
         List<StandableSurface> takeoffs = walkingRegion.stream()
                 .filter(surface -> landingRegion.stream().noneMatch(landing -> sameSurface(surface, landing)))
+                // The current planner generates flat supported approach prefixes. A reachable
+                // floor below the player is collision context, not another runway root.
+                .filter(surface -> Math.abs(surface.topY() - standing.topY()) <= 0.01)
                 .filter(surface -> landingRegion.stream().anyMatch(landing ->
-                        landing.topY() - surface.topY() <= 1.0001
-                                && edgeDistance(surface.footprint(), landing.footprint()) <= MAX_HORIZONTAL_EDGE_DISTANCE))
+                        landing.topY() < surface.topY() - 0.01
+                                || edgeDistance(surface.footprint(), landing.footprint())
+                                <= MAX_LEVEL_OR_UPWARD_EDGE_DISTANCE))
                 .sorted(Comparator.comparingDouble(surface -> landingRegion.stream()
                         .mapToDouble(landing -> edgeDistance(surface.footprint(), landing.footprint()))
                         .min().orElse(Double.MAX_VALUE)))
                 .toList();
         if (takeoffs.isEmpty()) return rejected(JumpRejectionReason.TOO_FAR,
-                "No reachable takeoff is within the supported 4.3-block edge distance.");
+                "No reachable takeoff is within the supported level/upward edge distance; "
+                        + "vertical reach is evaluated by physics after analysis.");
 
-        Box bounds = regionBounds(player.boundingBox(), takeoffs, landingRegion).expand(2, 3, 2);
+        List<StandableSurface> approachRegion = connectedApproachRegion(walkingRegion, takeoffs);
+        Box bounds = regionBounds(player.boundingBox(), approachRegion, landingRegion).expand(2, 3, 2);
         return new JumpProblemResult.Valid(new JumpProblem(selectedBlock, standing, landingRegion, takeoffs,
-                world.collisionBoxes(bounds), player, world.fingerprint(bounds)));
+                approachRegion, world.collisionBoxes(bounds), player, world.fingerprint(bounds)));
+    }
+
+    /**
+     * Planning prefixes are flat runway motion. Keep only the same-height walking components
+     * connected to a legal takeoff instead of handing the solver every reachable drop below
+     * the course (which can otherwise fill the 256-surface analysis bound).
+     */
+    private List<StandableSurface> connectedApproachRegion(
+            List<StandableSurface> walkingRegion, List<StandableSurface> takeoffs) {
+        Queue<StandableSurface> queue = new ArrayDeque<>(takeoffs);
+        List<StandableSurface> result = new ArrayList<>();
+        Set<String> visited = new HashSet<>();
+        while (!queue.isEmpty()) {
+            StandableSurface current = queue.remove();
+            if (!visited.add(surfaceKey(current))) continue;
+            result.add(current);
+            for (StandableSurface candidate : walkingRegion) {
+                if (!visited.contains(surfaceKey(candidate))
+                        && Math.abs(candidate.topY() - current.topY()) <= 0.01
+                        && footprintsTouch(current.footprint(), candidate.footprint())) {
+                    queue.add(candidate);
+                }
+            }
+        }
+        return List.copyOf(result);
     }
 
     private StandableSurface findStandingSurface(WorldView world, PlayerSnapshot player) {

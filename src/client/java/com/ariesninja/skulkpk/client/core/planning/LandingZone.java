@@ -61,6 +61,17 @@ public record LandingZone(
         return coreAnchors.isEmpty() ? fringeAnchors : coreAnchors;
     }
 
+    /**
+     * All legal settle anchors. Search decides whether a near-side fringe anchor is needed
+     * for reach; completed core landings still outrank fringe landings.
+     */
+    public List<LandingAnchor> allAnchors() {
+        List<LandingAnchor> result = new ArrayList<>(coreAnchors.size() + fringeAnchors.size());
+        result.addAll(coreAnchors);
+        result.addAll(fringeAnchors);
+        return List.copyOf(result);
+    }
+
     public boolean isCore(Box playerBox, Vec3d feet) {
         double area = playerBox.getLengthX() * playerBox.getLengthZ();
         double overlap = Math.min(area, SupportResolver.overlapArea(playerBox, feet.y, surfaces));

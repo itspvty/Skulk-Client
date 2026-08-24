@@ -169,6 +169,40 @@ class ParkourPhysicsTest {
         assertTrue(touched, outcomes.toString());
     }
 
+    @Test void productionKernelCanStablyClearATrueFourBlockGapFromAFullSprintRunway() {
+        InMemoryPhysicsWorld world = new InMemoryPhysicsWorld();
+        for (int x = -3; x <= 0; x++) world.floor(x, 0, 0);
+        world.floor(5, 0, 0);
+        ParkourState prefix = state(new Vec3d(-2.5, 0, 0.5), Vec3d.ZERO, true);
+        boolean stable = false;
+        StringBuilder outcomes = new StringBuilder();
+        for (int jumpTick = 0; jumpTick < 24 && prefix.onGround(); jumpTick++) {
+            for (int releaseTick : new int[]{60, 3, 5, 7, 9, 11, 14}) {
+                ParkourState flight = physics.tick(world, prefix,
+                        new ControlInput(1, 0, true, true, false, -90));
+                for (int tick = 0; tick < 40 && !flight.onGround(); tick++) {
+                    flight = physics.tick(world, flight,
+                            new ControlInput(tick < releaseTick ? 1 : 0, 0,
+                                    true, false, false, -90));
+                }
+                int supportedTicks = 0;
+                for (int tick = 0; tick < 24 && targetSupported(flight, 5); tick++) {
+                    float counter = flight.velocity().horizontalLength() > 0.04 ? -1 : 0;
+                    flight = physics.tick(world, flight,
+                            new ControlInput(counter, 0, false, false, false, -90));
+                    if (targetSupported(flight, 5)) supportedTicks++;
+                }
+                outcomes.append(jumpTick).append('/').append(releaseTick).append(':')
+                        .append(String.format("%.3f/%.2f/%d ", flight.feetPosition().x,
+                                flight.feetPosition().y, supportedTicks));
+                stable |= supportedTicks >= 14;
+            }
+            prefix = physics.tick(world, prefix,
+                    new ControlInput(1, 0, true, false, false, -90));
+        }
+        assertTrue(stable, outcomes.toString());
+    }
+
     private InMemoryPhysicsWorld runway() {
         InMemoryPhysicsWorld world = new InMemoryPhysicsWorld();
         for (int x = -2; x <= 3; x++) world.floor(x, 0, 0);
@@ -176,6 +210,10 @@ class ParkourPhysicsTest {
     }
     private ParkourState state(Vec3d feet, Vec3d velocity, boolean ground) {
         return ParkourState.capture(snapshot(feet, velocity, ground, Map.of()));
+    }
+    private boolean targetSupported(ParkourState state, int x) {
+        return state.onGround() && Math.abs(state.feetPosition().y) < 0.01
+                && state.boundingBox().maxX > x && state.boundingBox().minX < x + 1;
     }
     private PlayerSnapshot snapshot(Vec3d feet, Vec3d velocity, boolean ground,
                                     Map<String, PlayerSnapshot.EffectSnapshot> effects) {

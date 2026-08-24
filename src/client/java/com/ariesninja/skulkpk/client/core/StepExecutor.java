@@ -75,9 +75,9 @@ public final class StepExecutor {
         reason = "";
         state = ExecutionState.PLANNING;
         ChatMessageUtil.sendInfo(client, "Searching for a stable jump route...");
-        LOGGER.info("plan_start target={} takeoffs={} landingSurfaces={}",
+        LOGGER.info("plan_start target={} takeoffs={} approachSurfaces={} landingSurfaces={}",
                 planningProblem.selectedBlock().toShortString(), planningProblem.reachableTakeoffs().size(),
-                planningProblem.landingRegion().size());
+                planningProblem.approachRegion().size(), planningProblem.landingRegion().size());
         return true;
     }
 
@@ -137,7 +137,7 @@ public final class StepExecutor {
 
     private net.minecraft.util.math.Box problemBounds() {
         net.minecraft.util.math.Box bounds = planningProblem.player().boundingBox();
-        for (var surface : planningProblem.reachableTakeoffs()) bounds = bounds.union(surface.footprint());
+        for (var surface : planningProblem.approachRegion()) bounds = bounds.union(surface.footprint());
         for (var surface : planningProblem.landingRegion()) bounds = bounds.union(surface.footprint());
         return bounds.expand(2, 3, 2);
     }

@@ -24,6 +24,9 @@ public final class SearchPlanningSession implements PlanningSession {
     private static final long DIRECT_BUDGET_NANOS = 200_000_000L;
     private static final long LANDING_RESERVE_NANOS = 100_000_000L;
     private static final double PLAYER_RADIUS = 0.3;
+    private static final double STANDARD_TRIGGER_MINIMUM = -0.10;
+    private static final double MAXIMUM_REACH_TRIGGER_MINIMUM = -(PLAYER_RADIUS * 2 + 0.35);
+    private static final double OBSTACLE_GUIDE_CLEARANCE = 0.22;
     private static final double RUN_UP_INCREMENT = 0.25;
     private static final int MAX_LANES = 36;
     private static final int MAX_LAUNCH_STATES = 96;
@@ -42,9 +45,10 @@ public final class SearchPlanningSession implements PlanningSession {
     private LandingZone landingZone;
     private List<LaunchLane> lanes = List.of();
     private List<LaunchState> launchStates = List.of();
+    private List<DirectTrial> directTrials = List.of();
+    private Map<Integer, List<ObstacleGuide>> obstacleGuides = Map.of();
     private PlanningStage stage = PlanningStage.DIRECT;
-    private int launchIndex;
-    private int scheduleIndex;
+    private int directTrialIndex;
     private int directEvaluations;
     private int flightStatesExpanded;
     private int statesDeduplicated;
@@ -104,51 +108,131 @@ public final class SearchPlanningSession implements PlanningSession {
     private void prepare() {
         landingZone = LandingZone.build(request.problem().landingRegion(), request.player());
         lanes = buildLaunchLanes();
+        obstacleGuides = buildObstacleGuides();
         launchStates = buildLaunchStates();
+        directTrials = buildDirectTrials();
         prepared = true;
         if (lanes.isEmpty()) recordRejection("No fixed takeoff edge had a supported approach corridor.");
         if (launchStates.isEmpty()) recordRejection("Insufficient runway: no prefix reached its trigger interval.");
     }
 
     private PlanningTickResult tickDirect(long now) {
-        if (now >= directDeadline || launchIndex >= launchStates.size()) {
+        if (now >= directDeadline || directTrialIndex >= directTrials.size()) {
             directFinishedNanos = now;
-            if (best != null && best.coreLanding) stage = PlanningStage.LANDING_VALIDATION;
+            if (best != null) stage = PlanningStage.LANDING_VALIDATION;
             else beginObstacle();
             return null;
         }
-        LaunchState launch = launchStates.get(launchIndex);
+        DirectTrial trial = directTrials.get(directTrialIndex++);
+        LaunchState launch = trial.launch();
         List<AirSchedule> schedules = directSchedules(launch);
-        Candidate candidate = simulateDirect(launch, schedules.get(scheduleIndex));
+        Candidate candidate = simulateDirect(launch, schedules.get(trial.scheduleIndex()));
         directEvaluations++;
         keep(candidate);
-        if (++scheduleIndex >= schedules.size()) {
-            scheduleIndex = 0;
-            launchIndex++;
-            if (best != null && best.coreLanding && (launchIndex >= launchStates.size()
-                    || minimumRemainingMomentumRank() > momentumRank(best.launch) + 1.0E-6)) {
-                directFinishedNanos = System.nanoTime();
-                stage = PlanningStage.LANDING_VALIDATION;
+        // Trials are wave-ordered across geometry; keep the direct stage open for its bounded
+        // budget so later waves can replace a synthetic route with a current-state/core route.
+        return null;
+    }
+
+    private List<DirectTrial> buildDirectTrials() {
+        if (launchStates.isEmpty()) return List.of();
+        Map<Integer, Integer> nextRank = new HashMap<>();
+        Map<LaunchState, Integer> stateRanks = new LinkedHashMap<>();
+        int maximumRank = 0;
+        for (LaunchState launch : launchStates) {
+            int rank = nextRank.getOrDefault(launch.lane().id(), 0);
+            stateRanks.put(launch, rank);
+            nextRank.put(launch.lane().id(), rank + 1);
+            maximumRank = Math.max(maximumRank, rank);
+        }
+        int scheduleCount = directSchedules(launchStates.getFirst()).size();
+        List<Integer> scheduleOrder = new ArrayList<>();
+        for (int preferred : new int[]{0, 4, 3, 5, 2, 6, 1}) {
+            if (preferred < scheduleCount) scheduleOrder.add(preferred);
+        }
+        for (int index = 0; index < scheduleCount; index++) {
+            if (!scheduleOrder.contains(index)) scheduleOrder.add(index);
+        }
+        List<DirectTrial> result = new ArrayList<>();
+        for (int stateRank = 0; stateRank <= maximumRank; stateRank++) {
+            for (int scheduleRank = 0; scheduleRank < scheduleOrder.size(); scheduleRank++) {
+                int schedule = scheduleOrder.get(scheduleRank);
+                for (LaunchState launch : launchStates) {
+                    if (stateRanks.get(launch) == stateRank) {
+                        result.add(new DirectTrial(launch, schedule));
+                    }
+                }
             }
         }
-        return null;
+        return List.copyOf(result);
     }
 
     private void beginObstacle() {
         stage = PlanningStage.OBSTACLE;
         obstacleStartedNanos = System.nanoTime();
         List<ObstacleNode> roots = new ArrayList<>();
-        for (LaunchState launch : launchStates.stream().limit(20).toList()) {
-            for (float strafe : new float[]{0, -1, 1}) {
-                ControlFrame jump = frame(1, strafe, true, true, launch.lane().yaw(),
-                        ControlPhase.TAKEOFF, FrameGuard.GROUNDED);
-                ParkourState next = advance(launch.state(), jump);
-                if (next != null && !next.onGround()) roots.add(new ObstacleNode(next, launch,
-                        null, jump, 1, collisionSignature(next), obstacleScore(next, launch.lane())));
+        for (LaunchState launch : obstacleLaunchStates()) {
+            for (ObstacleGuide guide : obstacleGuides.getOrDefault(launch.lane().id(), List.of())) {
+                int guideIndex = guide.advance(launch.state().feetPosition(), 0);
+                float guideYaw = boundedYaw(launch.state().yaw(), guide.desiredYaw(
+                        launch.state().feetPosition(), guideIndex, launch.lane()));
+                float guidedStrafe = guide.side() == 0 ? 0 : guide.side() * 0.35f;
+                for (float strafe : new float[]{0, guidedStrafe}) {
+                    ControlFrame jump = frame(1, strafe, launch.state().sprinting(), true, guideYaw,
+                            ControlPhase.TAKEOFF, FrameGuard.GROUNDED);
+                    ParkourState next = advance(launch.state(), jump);
+                    if (next != null && !next.onGround()) {
+                        int nextGuideIndex = guide.advance(next.feetPosition(), guideIndex);
+                        roots.add(new ObstacleNode(next, launch, guide, nextGuideIndex,
+                                null, jump, 1, collisionSignature(next),
+                                obstacleScore(next, launch.lane(), guide, nextGuideIndex)));
+                    }
+                }
             }
         }
         obstacleFrontier = retainDiverse(roots);
         if (obstacleFrontier.isEmpty()) recordRejection("No physically viable flight root left takeoff support.");
+    }
+
+    private List<LaunchState> obstacleLaunchStates() {
+        Map<Integer, List<LaunchState>> byLane = new LinkedHashMap<>();
+        for (LaunchState launch : launchStates) {
+            // Near-side fringe anchors expand direct maximum-reach geometry. They must not
+            // multiply obstacle homotopies when a stable core exists, or the 256-state beam is
+            // diluted across duplicate neo routes before it clears the pillar.
+            if (!launch.lane().landingAnchor().core() && !landingZone.coreAnchors().isEmpty()) continue;
+            byLane.computeIfAbsent(launch.lane().id(), ignored -> new ArrayList<>()).add(launch);
+        }
+        byLane.values().forEach(states -> states.sort(Comparator
+                .comparing((LaunchState state) -> !state.state().sprinting())
+                .thenComparing(Comparator.comparingDouble((LaunchState state) ->
+                        Math.abs(state.lane().lateralError(state.state().feetPosition()))).reversed())
+                .thenComparing(Comparator.comparingDouble(this::forwardSpeed).reversed())
+                .thenComparingDouble(this::launchCost)));
+        List<LaunchState> selected = new ArrayList<>();
+        for (int rank = 0; selected.size() < 32; rank++) {
+            boolean added = false;
+            for (List<LaunchState> states : byLane.values()) {
+                if (rank >= states.size()) continue;
+                selected.add(states.get(rank));
+                added = true;
+                if (selected.size() >= 32) break;
+            }
+            if (!added) break;
+        }
+        return List.copyOf(selected);
+    }
+
+    private boolean requiresMaximumReach(LaunchLane lane) {
+        // Anchor distance becomes misleading for a legal fringe landing: the mutually nearest
+        // player positions can be only ~4.1 apart even though the actual platform-edge gap is
+        // the full four blocks. Use platform geometry as the primary reach classification so
+        // edge-departure momentum is retained for shifted/diagonal maximum jumps as well.
+        double platformGap = landingZone.surfaces().stream()
+                .mapToDouble(surface -> edgeDistance(lane.takeoffSurface().footprint(), surface.footprint()))
+                .min().orElse(Double.MAX_VALUE);
+        return platformGap >= 3.75
+                || horizontalDistance(lane.takeoffPoint(), lane.landingAnchor().feet()) >= 4.20;
     }
 
     private PlanningTickResult tickObstacle(long now) {
@@ -198,9 +282,11 @@ public final class SearchPlanningSession implements PlanningSession {
                         reconstructObstacleStates(node, next), PlanningStage.OBSTACLE));
                 continue;
             }
-            ObstacleNode child = new ObstacleNode(next, node.launch, node, action,
-                    node.airTicks + 1, mergeCollisionSignature(node.collisionSignature, next),
-                    obstacleScore(next, node.launch.lane()));
+            int guideIndex = node.guide.advance(next.feetPosition(), node.guideIndex);
+            ObstacleNode child = new ObstacleNode(next, node.launch, node.guide, guideIndex,
+                    node, action, node.airTicks + 1,
+                    mergeCollisionSignature(node.collisionSignature, next),
+                    obstacleScore(next, node.launch.lane(), node.guide, guideIndex));
             ObstacleStateKey key = ObstacleStateKey.from(child);
             ObstacleNode existing = obstacleNext.get(key);
             if (existing == null || child.score < existing.score) obstacleNext.put(key, child);
@@ -248,9 +334,13 @@ public final class SearchPlanningSession implements PlanningSession {
             ParkourState end = states.getLast();
             double margin = SupportResolver.edgeMargin(end.boundingBox(), end.feetPosition().y,
                     request.problem().landingRegion());
+            int horizontalContacts = (int) states.stream().filter(ParkourState::horizontalCollision).count();
+            double obstacleClearance = trajectoryObstacleClearance(states);
             return new Candidate(launch, List.copyOf(frames), List.copyOf(states), method,
                     landingZone.isCore(end.boundingBox(), end.feetPosition()), margin,
-                    end.velocity().horizontalLength(), 1, inputChurn(frames), launchCost(launch), sourceStage);
+                    end.velocity().horizontalLength(), 1, inputChurn(frames), launchCost(launch),
+                    horizontalContacts, obstacleClearance,
+                    !requiresPreparedMomentum(launch.lane()) || launch.state().sprinting(), sourceStage);
         }
         recordRejection("Unstable landing: target contact could not remain supported through settling.");
         return null;
@@ -299,8 +389,8 @@ public final class SearchPlanningSession implements PlanningSession {
     private List<LaunchLane> buildLaunchLanes() {
         List<LaunchLane> result = new ArrayList<>();
         int id = 0;
-        for (LandingZone.LandingAnchor anchor : landingZone.preferredAnchors().stream().limit(8).toList()) {
-            for (StandableSurface surface : request.problem().reachableTakeoffs()) {
+        for (StandableSurface surface : request.problem().reachableTakeoffs()) {
+            for (LandingZone.LandingAnchor anchor : landingAnchorsFor(surface)) {
                 Vec3d roughDirection = horizontalDirection(surface.centerFeet(), anchor.feet());
                 Vec3d roughEdge = edgePoint(surface, roughDirection, 0);
                 if (!isExposedEdge(surface, roughEdge, roughDirection)) continue;
@@ -311,14 +401,70 @@ public final class SearchPlanningSession implements PlanningSession {
                     double runUp = traceRunUp(takeoff, heading, surface.topY());
                     Box corridor = playerBox(takeoff).union(playerBox(takeoff.subtract(heading.multiply(runUp))));
                     Vec3d side = ControlInput.strafeDirection(heading);
-                    result.add(new LaunchLane(id++, surface, takeoff.subtract(side.multiply(0.20)),
+                    boolean maximumReach = landingZone.surfaces().stream()
+                            .mapToDouble(landing -> edgeDistance(surface.footprint(), landing.footprint()))
+                            .min().orElse(Double.MAX_VALUE) >= 3.75;
+                    LaunchLane edgeLane = new LaunchLane(id++, surface,
+                            takeoff.subtract(side.multiply(0.20)),
                             takeoff.add(side.multiply(0.20)), takeoff, corridor, heading, yaw(heading),
-                            -0.10, 0.42, runUp, anchor));
-                    if (result.size() >= MAX_LANES) return sortLanes(result);
+                            maximumReach ? MAXIMUM_REACH_TRIGGER_MINIMUM : STANDARD_TRIGGER_MINIMUM,
+                            0.42, runUp, anchor);
+                    result.add(edgeLane);
+
+                    // A pillar touching the exposed edge leaves no flight time to establish
+                    // lateral clearance. Keep the real edge lane, but also create deterministic
+                    // early-jump lanes on the supported runway. This is equivalent to the
+                    // physically useful geometry produced when the last runway block is absent,
+                    // without requiring the player to edit the course.
+                    if (firstBlockingObstacle(edgeLane) != null) {
+                        for (double setback : new double[]{0.45, 0.75, 1.05}) {
+                            Vec3d early = takeoff.subtract(heading.multiply(setback));
+                            StandableSurface earlySurface = supportingApproachSurface(early, surface.topY());
+                            if (earlySurface == null || !fullSupport(early, surface.topY()) || !bodyClear(early)) {
+                                continue;
+                            }
+                            double earlyRunUp = traceRunUp(early, heading, surface.topY());
+                            Box earlyCorridor = playerBox(early).union(
+                                    playerBox(early.subtract(heading.multiply(earlyRunUp))));
+                            result.add(new LaunchLane(id++, earlySurface,
+                                    early.subtract(side.multiply(0.20)), early.add(side.multiply(0.20)),
+                                    early, earlyCorridor, heading, yaw(heading), -0.12, 0.32,
+                                    earlyRunUp, anchor));
+                        }
+                    }
                 }
             }
         }
-        return sortLanes(result);
+        return sortLanes(result).stream().limit(MAX_LANES).toList();
+    }
+
+    /**
+     * A maximum-distance diagonal is often possible only from the mutually nearest edges.
+     * Keep those geometric anchors alongside interior/core anchors instead of globally
+     * discarding every fringe anchor whenever the target happens to have a core.
+     */
+    private List<LandingZone.LandingAnchor> landingAnchorsFor(StandableSurface takeoff) {
+        LinkedHashSet<LandingZone.LandingAnchor> selected = new LinkedHashSet<>();
+        Comparator<LandingZone.LandingAnchor> nearest = Comparator
+                .comparingDouble((LandingZone.LandingAnchor anchor) ->
+                        distanceToFootprint(anchor.feet(), takeoff.footprint()))
+                .thenComparing(Comparator.comparingDouble(
+                        LandingZone.LandingAnchor::supportMargin).reversed());
+        // Put one safest interior family first, then the mutually nearest legal fringes.
+        // Direct evaluation consumes launch roots in lane-id order, so this deliberately gives
+        // shifted maximum jumps early budget without regressing centered ordinary routes.
+        landingZone.preferredAnchors().stream().limit(1).forEach(selected::add);
+        landingZone.fringeAnchors().stream().sorted(nearest).limit(2).forEach(selected::add);
+        landingZone.preferredAnchors().stream().skip(1).limit(7).forEach(selected::add);
+        if (selected.isEmpty()) landingZone.preferredAnchors().stream().limit(8).forEach(selected::add);
+        return List.copyOf(selected);
+    }
+
+    private StandableSurface supportingApproachSurface(Vec3d feet, double topY) {
+        return request.problem().approachRegion().stream()
+                .filter(surface -> Math.abs(surface.topY() - topY) <= 0.02)
+                .filter(surface -> pointOnSurface(feet, surface, 0.01))
+                .findFirst().orElse(null);
     }
 
     private List<LaunchLane> sortLanes(List<LaunchLane> value) {
@@ -330,6 +476,76 @@ public final class SearchPlanningSession implements PlanningSession {
                 .thenComparingInt(LaunchLane::id)).toList();
     }
 
+    /**
+     * Builds fixed left/right homotopy guides around the first body-sized obstruction on a
+     * lane. The beam still owns the controls, but it no longer has to discover which side of
+     * a wall to commit to from an undifferentiated distance heuristic.
+     */
+    private Map<Integer, List<ObstacleGuide>> buildObstacleGuides() {
+        Map<Integer, List<ObstacleGuide>> result = new LinkedHashMap<>();
+        int guideId = 0;
+        for (LaunchLane lane : lanes) {
+            List<ObstacleGuide> guides = new ArrayList<>();
+            guides.add(new ObstacleGuide(guideId++, 0, List.of()));
+            BlockingObstacle blocking = firstBlockingObstacle(lane);
+            if (blocking != null) {
+                for (int sideSign : new int[]{-1, 1}) {
+                    double lateral = sideSign < 0
+                            ? blocking.minimumLateral - OBSTACLE_GUIDE_CLEARANCE
+                            : blocking.maximumLateral + OBSTACLE_GUIDE_CLEARANCE;
+                    double near = Math.max(0.12, blocking.minimumLongitudinal - 0.18);
+                    double far = Math.min(blocking.routeLength - 0.10,
+                            blocking.maximumLongitudinal + 0.18);
+                    if (far <= near + 0.05) continue;
+                    Vec3d side = ControlInput.strafeDirection(lane.heading());
+                    Vec3d nearPoint = lane.takeoffPoint().add(lane.heading().multiply(near))
+                            .add(side.multiply(lateral));
+                    Vec3d farPoint = lane.takeoffPoint().add(lane.heading().multiply(far))
+                            .add(side.multiply(lateral));
+                    guides.add(new ObstacleGuide(guideId++, sideSign,
+                            List.of(nearPoint, farPoint)));
+                }
+            }
+            result.put(lane.id(), List.copyOf(guides));
+        }
+        return Map.copyOf(result);
+    }
+
+    private BlockingObstacle firstBlockingObstacle(LaunchLane lane) {
+        double routeLength = horizontalDistance(lane.takeoffPoint(), lane.landingAnchor().feet());
+        Vec3d side = ControlInput.strafeDirection(lane.heading());
+        BlockingObstacle best = null;
+        for (Box raw : request.problem().nearbyCollision()) {
+            // Floors are support, not lateral route obstructions. Low head blocks remain in
+            // the direct/contact solver; only body-height walls get side guides.
+            if (raw.maxY <= Math.min(lane.takeoffPoint().y, lane.landingAnchor().feet().y) + 0.20
+                    || raw.minY >= lane.takeoffPoint().y + 1.65) continue;
+            Box expanded = raw.expand(PLAYER_RADIUS + 0.06, 0, PLAYER_RADIUS + 0.06);
+            double minLong = Double.POSITIVE_INFINITY, maxLong = Double.NEGATIVE_INFINITY;
+            double minSide = Double.POSITIVE_INFINITY, maxSide = Double.NEGATIVE_INFINITY;
+            for (Vec3d corner : horizontalCorners(expanded, lane.takeoffPoint().y)) {
+                Vec3d relative = corner.subtract(lane.takeoffPoint());
+                double longitudinal = relative.dotProduct(lane.heading());
+                double lateral = relative.dotProduct(side);
+                minLong = Math.min(minLong, longitudinal);
+                maxLong = Math.max(maxLong, longitudinal);
+                minSide = Math.min(minSide, lateral);
+                maxSide = Math.max(maxSide, lateral);
+            }
+            if (maxLong <= 0.05 || minLong >= routeLength - 0.05
+                    || minSide > 0 || maxSide < 0) continue;
+            BlockingObstacle candidate = new BlockingObstacle(raw, minLong, maxLong,
+                    minSide, maxSide, routeLength);
+            if (best == null || candidate.minimumLongitudinal < best.minimumLongitudinal) best = candidate;
+        }
+        return best;
+    }
+
+    private List<Vec3d> horizontalCorners(Box box, double y) {
+        return List.of(new Vec3d(box.minX, y, box.minZ), new Vec3d(box.minX, y, box.maxZ),
+                new Vec3d(box.maxX, y, box.minZ), new Vec3d(box.maxX, y, box.maxZ));
+    }
+
     private List<LaunchState> buildLaunchStates() {
         List<LaunchState> result = new ArrayList<>();
         PlayerSnapshot player = request.player();
@@ -337,9 +553,9 @@ public final class SearchPlanningSession implements PlanningSession {
         for (LaunchLane lane : lanes) {
             double remaining = lane.distanceBeforeEdge(player.feetPosition());
             boolean supported = SupportResolver.overlapArea(player.boundingBox(), player.feetPosition().y,
-                    request.problem().reachableTakeoffs()) > footArea * 0.45;
+                    request.problem().approachRegion()) > footArea * 0.45;
             if (supported && Math.abs(lane.lateralError(player.feetPosition())) <= 0.55
-                    && remaining >= -0.10 && remaining <= lane.availableRunUp() + 0.75) {
+                    && remaining >= lane.triggerMinimum() && remaining <= lane.availableRunUp() + 0.75) {
                 ParkourState current = pose(ParkourState.capture(player), player.feetPosition(),
                         player.velocity(), lane.yaw(), player.onGround(), player.sprinting(), false);
                 collectLaunchStates(result, current, lane, current.feetPosition(), true,
@@ -363,6 +579,13 @@ public final class SearchPlanningSession implements PlanningSession {
                 if (result.size() >= MAX_LAUNCH_STATES * 2) break;
             }
         }
+        // An immediate corner obstruction needs lateral momentum before flight. Generate a
+        // compact family of deterministic late diagonal prefixes from the same runway; the
+        // obstacle beam remains flight-only and does not wander over ground states.
+        for (LaunchLane lane : lanes) {
+            if (obstacleGuides.getOrDefault(lane.id(), List.of()).stream()
+                    .anyMatch(guide -> guide.side() != 0)) collectCornerLaunchStates(result, lane);
+        }
         Map<String, LaunchState> unique = new LinkedHashMap<>();
         result.stream().sorted(Comparator.comparing(LaunchState::startsFromCurrentState).reversed()
                 .thenComparingDouble(this::launchCost).thenComparingInt(state -> state.lane().id())
@@ -371,14 +594,63 @@ public final class SearchPlanningSession implements PlanningSession {
         return prioritizeLaunchStates(new ArrayList<>(unique.values()));
     }
 
+    private void collectCornerLaunchStates(List<LaunchState> output, LaunchLane lane) {
+        if (lane.availableRunUp() < 0.70) return;
+        double runUp = lane.availableRunUp();
+        Vec3d staging = lane.takeoffPoint().subtract(lane.heading().multiply(runUp));
+        if (!fullSupport(staging, lane.takeoffSurface().topY()) || !bodyClear(staging)) return;
+        ParkourState initial = ParkourState.at(request.player(), staging, Vec3d.ZERO,
+                lane.yaw(), true, false);
+        for (int side : new int[]{-1, 1}) {
+            for (double turnDistance : new double[]{0.55, 0.85, 1.15, 1.45}) {
+                ParkourState state = initial;
+                List<ControlInput> prefix = new ArrayList<>();
+                for (int tick = 0; tick <= MAX_GROUND_TICKS; tick++) {
+                    if (lane.inTriggerInterval(state.feetPosition())
+                            && Math.abs(lane.lateralError(state.feetPosition())) >= 0.42
+                            && bodyClear(state.feetPosition())) {
+                        output.add(new LaunchState(initial, state, lane, staging, runUp,
+                                tick, List.copyOf(prefix), false));
+                    }
+                    if (lane.distanceBeforeEdge(state.feetPosition()) < lane.triggerMinimum()) break;
+                    float strafe = lane.distanceBeforeEdge(state.feetPosition()) <= turnDistance ? side : 0;
+                    ControlInput input = new ControlInput(1, strafe, true, false, false, lane.yaw());
+                    ParkourState next;
+                    try { next = physics.tick(request.world(), state, input); }
+                    catch (ParkourPhysics.UnsupportedPhysicsStateException exception) { break; }
+                    SupportResolver.Contact contact = SupportResolver.resolve(next.boundingBox(),
+                            next.feetPosition(), next.onGround(), request.problem().landingRegion(),
+                            request.problem().approachRegion(), request.world());
+                    if (!next.onGround() || next.horizontalCollision()) break;
+                    prefix.add(input);
+                    if (contact.kind() != SupportKind.TAKEOFF) {
+                        if (contact.kind() == SupportKind.NONE
+                                && lane.inTriggerInterval(next.feetPosition())
+                                && Math.abs(lane.lateralError(next.feetPosition())) >= 0.42
+                                && bodyClear(next.feetPosition())) {
+                            output.add(new LaunchState(initial, next, lane, staging, runUp,
+                                    tick + 1, List.copyOf(prefix), false));
+                        }
+                        break;
+                    }
+                    state = next;
+                }
+            }
+        }
+    }
+
     private List<LaunchState> prioritizeLaunchStates(List<LaunchState> states) {
         Map<Integer, List<LaunchState>> byLane = new LinkedHashMap<>();
         for (LaunchState state : states) byLane.computeIfAbsent(state.lane().id(), ignored -> new ArrayList<>())
                 .add(state);
         for (List<LaunchState> laneStates : byLane.values()) laneStates.sort((first, second) -> {
-            double required = horizontalDistance(first.lane().takeoffPoint(),
-                    first.lane().landingAnchor().feet());
-            if (required >= 3.0) {
+            if (requiresPreparedMomentum(first.lane())) {
+                if (requiresMaximumReach(first.lane())) {
+                    int departure = -Boolean.compare(isEdgeDeparture(first), isEdgeDeparture(second));
+                    if (departure != 0) return departure;
+                }
+                int sprint = -Boolean.compare(first.state().sprinting(), second.state().sprinting());
+                if (sprint != 0) return sprint;
                 int speed = -Double.compare(forwardSpeed(first), forwardSpeed(second));
                 if (speed != 0) return speed;
             }
@@ -402,6 +674,27 @@ public final class SearchPlanningSession implements PlanningSession {
         return List.copyOf(prioritized);
     }
 
+    private boolean isEdgeDeparture(LaunchState launch) {
+        return launch.state().onGround() && SupportResolver.overlapArea(
+                launch.state().boundingBox(), launch.state().feetPosition().y,
+                request.problem().approachRegion()) <= 1.0E-5;
+    }
+
+    private boolean requiresPreparedMomentum(LaunchLane lane) {
+        double distance = horizontalDistance(lane.takeoffPoint(), lane.landingAnchor().feet());
+        double rise = lane.landingAnchor().feet().y - lane.takeoffPoint().y;
+        return distance >= 2.45 || rise >= 0.45 || hasLowOverhead(lane);
+    }
+
+    private boolean hasLowOverhead(LaunchLane lane) {
+        Vec3d forward = lane.heading().multiply(Math.min(1.35,
+                horizontalDistance(lane.takeoffPoint(), lane.landingAnchor().feet())));
+        Box launchBody = playerBox(lane.takeoffPoint());
+        Box headSweep = launchBody.union(launchBody.offset(forward).offset(0, 0.75, 0));
+        return request.world().collisionBoxes(headSweep).stream().anyMatch(box ->
+                box.minY >= lane.takeoffPoint().y + 1.65 && box.minY <= lane.takeoffPoint().y + 2.55);
+    }
+
     private double forwardSpeed(LaunchState state) {
         return state.state().velocity().dotProduct(state.lane().heading());
     }
@@ -411,7 +704,8 @@ public final class SearchPlanningSession implements PlanningSession {
         ParkourState state = initial;
         List<ControlInput> prefix = new ArrayList<>();
         for (int tick = 0; tick <= MAX_GROUND_TICKS; tick++) {
-            if (lane.inTriggerInterval(state.feetPosition()) && (current || nominalRunUp == 0 || tick > 0)) {
+            if (lane.inTriggerInterval(state.feetPosition()) && bodyClear(state.feetPosition())
+                    && (current || nominalRunUp == 0 || tick > 0)) {
                 output.add(new LaunchState(initial, state, lane, staging,
                         Math.min(nominalRunUp, horizontalDistance(staging, state.feetPosition())),
                         tick, List.copyOf(prefix), current));
@@ -423,15 +717,32 @@ public final class SearchPlanningSession implements PlanningSession {
             catch (ParkourPhysics.UnsupportedPhysicsStateException exception) { return; }
             SupportResolver.Contact contact = SupportResolver.resolve(next.boundingBox(), next.feetPosition(),
                     next.onGround(), request.problem().landingRegion(),
-                    request.problem().reachableTakeoffs(), request.world());
-            if (!next.onGround() || next.horizontalCollision() || contact.kind() != SupportKind.TAKEOFF) break;
+                    request.problem().approachRegion(), request.world());
+            if (!next.onGround() || next.horizontalCollision()) break;
             prefix.add(input);
+            if (contact.kind() != SupportKind.TAKEOFF) {
+                // Minecraft can retain onGround for the horizontal edge-departure tick because
+                // vertical collision is resolved from the previously supported box. That final
+                // state is essential to maximum-distance jumps. Keep exactly that one state,
+                // only inside the bounded trigger interval, and never continue ground motion
+                // after support has actually gone.
+                if (contact.kind() == SupportKind.NONE && lane.inTriggerInterval(next.feetPosition())
+                        && bodyClear(next.feetPosition())) {
+                    output.add(new LaunchState(initial, next, lane, staging,
+                            Math.min(nominalRunUp, horizontalDistance(staging, next.feetPosition())),
+                            tick + 1, List.copyOf(prefix), current));
+                }
+                break;
+            }
             state = next;
         }
     }
 
     private List<AirSchedule> directSchedules(LaunchState launch) {
-        boolean sprint = launch.state().sprinting() || launch.runUpLength() >= 0.5;
+        // Sprint-jump impulse is a takeoff mechanic, not a property inferred from route length.
+        // Momentum/head-contact routes are therefore evaluated from a state that has already
+        // entered sprint; short routes preserve their naturally generated sprint state.
+        boolean sprint = launch.state().sprinting();
         List<AirSchedule> schedules = new ArrayList<>();
         schedules.add(new AirSchedule(sprint, 120, false, 0, 0, 0));
         for (int release : new int[]{3, 5, 7, 9, 11, 14})
@@ -446,15 +757,19 @@ public final class SearchPlanningSession implements PlanningSession {
     }
 
     private List<ControlFrame> obstacleActions(ObstacleNode node) {
-        float yaw = node.launch.lane().yaw();
+        float targetYaw = node.guide.desiredYaw(node.state.feetPosition(),
+                node.guideIndex, node.launch.lane());
+        float yaw = boundedYaw(node.state.yaw(), targetYaw);
+        float inward = node.guide.side() == 0 ? 0 : node.guide.side() * 0.45f;
         boolean sprint = node.state.sprinting();
         return List.of(frame(1, 0, sprint, false, yaw, ControlPhase.AIRBORNE, FrameGuard.AIRBORNE),
                 frame(0, 0, false, false, yaw, ControlPhase.AIRBORNE, FrameGuard.AIRBORNE),
                 frame(-1, 0, false, false, yaw, ControlPhase.AIRBORNE, FrameGuard.AIRBORNE),
-                frame(1, -1, sprint, false, yaw, ControlPhase.AIRBORNE, FrameGuard.AIRBORNE),
-                frame(1, 1, sprint, false, yaw, ControlPhase.AIRBORNE, FrameGuard.AIRBORNE),
-                frame(1, -1, sprint, false, yaw - 10, ControlPhase.AIRBORNE, FrameGuard.AIRBORNE),
-                frame(1, 1, sprint, false, yaw + 10, ControlPhase.AIRBORNE, FrameGuard.AIRBORNE));
+                frame(1, inward, sprint, false, yaw, ControlPhase.AIRBORNE, FrameGuard.AIRBORNE),
+                frame(1, -1, sprint, false, boundedYaw(node.state.yaw(), targetYaw - 8),
+                        ControlPhase.AIRBORNE, FrameGuard.AIRBORNE),
+                frame(1, 1, sprint, false, boundedYaw(node.state.yaw(), targetYaw + 8),
+                        ControlPhase.AIRBORNE, FrameGuard.AIRBORNE));
     }
 
     private List<ObstacleNode> retainDiverse(List<ObstacleNode> nodes) {
@@ -472,13 +787,22 @@ public final class SearchPlanningSession implements PlanningSession {
         return List.copyOf(retained);
     }
 
-    private double obstacleScore(ParkourState state, LaunchLane lane) {
+    private double obstacleScore(ParkourState state, LaunchLane lane,
+                                 ObstacleGuide guide, int guideIndex) {
         Vec3d predicted = predictedTouchdown(state);
         Vec3d delta = lane.landingAnchor().feet().subtract(predicted);
         Vec3d side = ControlInput.strafeDirection(lane.heading());
+        Vec3d guideTarget = guide.target(guideIndex, lane);
+        double guideDistance = horizontalDistance(state.feetPosition(), guideTarget)
+                + guide.remainingDistance(guideIndex, lane);
+        double guideCrossTrack = guide.crossTrackError(state.feetPosition(), guideIndex, lane);
+        double clearance = bodyObstacleClearance(state);
         return Math.abs(delta.dotProduct(lane.heading())) * 8 + Math.abs(delta.dotProduct(side)) * 14
                 + Math.abs(predicted.y - lane.landingAnchor().feet().y) * 4
-                + state.velocity().horizontalLength() * 0.3 + (state.horizontalCollision() ? 0.2 : 0);
+                + guideDistance * 1.5 + guideCrossTrack * 5
+                + state.velocity().horizontalLength() * 0.3
+                + (state.horizontalCollision() ? 12 : 0)
+                + Math.max(0, 0.18 - clearance) * 30;
     }
 
     private Vec3d predictedTouchdown(ParkourState state) {
@@ -666,7 +990,7 @@ public final class SearchPlanningSession implements PlanningSession {
 
     private SupportResolver.Contact support(ParkourState state) {
         return SupportResolver.resolve(state.boundingBox(), state.feetPosition(), state.onGround(),
-                request.problem().landingRegion(), request.problem().reachableTakeoffs(), request.world());
+                request.problem().landingRegion(), request.problem().approachRegion(), request.world());
     }
 
     private ParkourState pose(ParkourState state, Vec3d feet, Vec3d velocity, float yaw,
@@ -696,7 +1020,7 @@ public final class SearchPlanningSession implements PlanningSession {
     private boolean fullSupport(Vec3d feet, double topY) {
         if (Math.abs(feet.y - topY) > 0.08) return false;
         Box box = playerBox(feet);
-        return SupportResolver.overlapArea(box, feet.y, request.problem().reachableTakeoffs())
+        return SupportResolver.overlapArea(box, feet.y, request.problem().approachRegion())
                 >= box.getLengthX() * box.getLengthZ() - 1.0E-4;
     }
 
@@ -704,9 +1028,43 @@ public final class SearchPlanningSession implements PlanningSession {
         return request.world().collisionBoxes(playerBox(feet).expand(-0.01)).isEmpty();
     }
 
+    private double bodyObstacleClearance(ParkourState state) {
+        return bodyObstacleClearance(state.boundingBox(), state.feetPosition().y);
+    }
+
+    private double trajectoryObstacleClearance(List<ParkourState> states) {
+        double minimum = 10;
+        for (int index = 0; index < states.size(); index++) {
+            ParkourState state = states.get(index);
+            minimum = Math.min(minimum, bodyObstacleClearance(state));
+            if (index == 0) continue;
+            ParkourState previous = states.get(index - 1);
+            Vec3d movement = state.feetPosition().subtract(previous.feetPosition());
+            for (double fraction : new double[]{0.25, 0.50, 0.75}) {
+                minimum = Math.min(minimum, bodyObstacleClearance(
+                        previous.boundingBox().offset(movement.multiply(fraction)),
+                        previous.feetPosition().y + movement.y * fraction));
+            }
+        }
+        return minimum;
+    }
+
+    private double bodyObstacleClearance(Box body, double feetY) {
+        double minimum = 10;
+        for (Box obstacle : request.problem().nearbyCollision()) {
+            // Collision tops supporting the current feet are floors, not side obstacles.
+            if (obstacle.maxY <= feetY + 0.05
+                    || obstacle.minY >= body.maxY - 0.05) continue;
+            double dx = Math.max(0, Math.max(obstacle.minX - body.maxX, body.minX - obstacle.maxX));
+            double dz = Math.max(0, Math.max(obstacle.minZ - body.maxZ, body.minZ - obstacle.maxZ));
+            minimum = Math.min(minimum, Math.hypot(dx, dz));
+        }
+        return minimum;
+    }
+
     private boolean isExposedEdge(StandableSurface surface, Vec3d edge, Vec3d direction) {
         Vec3d beyond = edge.add(direction.multiply(0.38));
-        return request.problem().reachableTakeoffs().stream().noneMatch(other -> other != surface
+        return request.problem().approachRegion().stream().noneMatch(other -> other != surface
                 && Math.abs(other.topY() - surface.topY()) <= 0.02 && pointOnSurface(beyond, other, 0.02));
     }
 
@@ -766,7 +1124,7 @@ public final class SearchPlanningSession implements PlanningSession {
 
     private Box problemBounds() {
         Box bounds = request.player().boundingBox();
-        for (StandableSurface surface : request.problem().reachableTakeoffs()) bounds = bounds.union(surface.footprint());
+        for (StandableSurface surface : request.problem().approachRegion()) bounds = bounds.union(surface.footprint());
         for (StandableSurface surface : request.problem().landingRegion()) bounds = bounds.union(surface.footprint());
         return bounds.expand(2, 3, 2);
     }
@@ -801,16 +1159,7 @@ public final class SearchPlanningSession implements PlanningSession {
     }
 
     private double momentumRank(LaunchState launch) {
-        return launch.startsFromCurrentState() && launch.runUpLength() <= 0.75
-                ? -1 : launch.runUpLength();
-    }
-
-    private double minimumRemainingMomentumRank() {
-        double minimum = Double.POSITIVE_INFINITY;
-        for (int index = launchIndex; index < launchStates.size(); index++) {
-            minimum = Math.min(minimum, momentumRank(launchStates.get(index)));
-        }
-        return minimum;
+        return launch.startsFromCurrentState() ? -1 : launch.runUpLength();
     }
 
     private int inputChurn(List<ControlFrame> frames) {
@@ -849,7 +1198,20 @@ public final class SearchPlanningSession implements PlanningSession {
     }
 
     private float yaw(Vec3d direction) { return (float) Math.toDegrees(Math.atan2(-direction.x, direction.z)); }
+    private float boundedYaw(float current, float desired) {
+        return current + MathHelper.clamp(MathHelper.wrapDegrees(desired - current), -12, 12);
+    }
     private double horizontalDistance(Vec3d a, Vec3d b) { return Math.hypot(a.x - b.x, a.z - b.z); }
+    private double distanceToFootprint(Vec3d point, Box box) {
+        double dx = Math.max(0, Math.max(box.minX - point.x, point.x - box.maxX));
+        double dz = Math.max(0, Math.max(box.minZ - point.z, point.z - box.maxZ));
+        return Math.hypot(dx, dz);
+    }
+    private double edgeDistance(Box first, Box second) {
+        double dx = Math.max(0, Math.max(first.minX - second.maxX, second.minX - first.maxX));
+        double dz = Math.max(0, Math.max(first.minZ - second.maxZ, second.minZ - first.maxZ));
+        return Math.hypot(dx, dz);
+    }
     private boolean pointOnSurface(Vec3d p, StandableSurface s, double t) {
         return p.x >= s.footprint().minX - t && p.x <= s.footprint().maxX + t
                 && p.z >= s.footprint().minZ - t && p.z <= s.footprint().maxZ + t;
@@ -867,13 +1229,19 @@ public final class SearchPlanningSession implements PlanningSession {
     }
 
     private static final Comparator<Candidate> CANDIDATE_ORDER = Comparator
-            .comparing((Candidate c) -> !c.coreLanding)
+            // Transit correctness comes before landing aesthetics. A centered landing reached
+            // through a 0.03-block pillar graze is less executable than a stable fringe landing
+            // with a clean flight corridor.
+            .comparingInt((Candidate c) -> c.horizontalContacts)
+            .thenComparing(Comparator.comparingDouble((Candidate c) -> c.obstacleClearance).reversed())
+            .thenComparing(c -> !c.momentumReady)
+            .thenComparing(c -> !c.coreLanding)
+            .thenComparing(c -> !c.launch.startsFromCurrentState())
             .thenComparing(Comparator.comparingDouble((Candidate c) -> c.edgeMargin).reversed())
             .thenComparingDouble(c -> c.landingSpeed)
             .thenComparing(Comparator.comparingInt((Candidate c) -> c.robustness).reversed())
             .thenComparing(c -> c.stoppingMethod == StoppingMethod.SNEAK)
-            .thenComparingDouble(c -> c.launch.startsFromCurrentState() && c.launch.runUpLength() <= 0.75
-                    ? -1 : c.launch.runUpLength())
+            .thenComparingDouble(c -> c.launch.startsFromCurrentState() ? -1 : c.launch.runUpLength())
             .thenComparingDouble(c -> c.launchCost).thenComparingInt(c -> c.churn)
             .thenComparingInt(c -> c.frames.size());
     private static final Comparator<ObstacleNode> OBSTACLE_ORDER = Comparator
@@ -884,11 +1252,65 @@ public final class SearchPlanningSession implements PlanningSession {
     private record Candidate(LaunchState launch, List<ControlFrame> frames, List<ParkourState> states,
                              StoppingMethod stoppingMethod, boolean coreLanding, double edgeMargin,
                              double landingSpeed, int robustness, int churn, double launchCost,
+                             int horizontalContacts, double obstacleClearance, boolean momentumReady,
                              PlanningStage sourceStage) {}
+    private record DirectTrial(LaunchState launch, int scheduleIndex) {}
     private record StoppingOutcome(List<ControlFrame> frames, List<ParkourState> states) {}
     private record EnvelopeResult(LaunchEnvelope envelope, int robustness) {}
-    private record ObstacleNode(ParkourState state, LaunchState launch, ObstacleNode parent,
-                                ControlFrame input, int airTicks, String collisionSignature, double score) {}
+    private record BlockingObstacle(Box box, double minimumLongitudinal, double maximumLongitudinal,
+                                    double minimumLateral, double maximumLateral, double routeLength) {}
+    private record ObstacleGuide(int id, int side, List<Vec3d> waypoints) {
+        ObstacleGuide { waypoints = List.copyOf(waypoints); }
+
+        int advance(Vec3d feet, int current) {
+            int index = current;
+            while (index < waypoints.size()) {
+                Vec3d target = waypoints.get(index);
+                if (horizontalDistanceStatic(feet, target) > 0.32) break;
+                index++;
+            }
+            return index;
+        }
+
+        Vec3d target(int index, LaunchLane lane) {
+            return index < waypoints.size() ? waypoints.get(index) : lane.landingAnchor().feet();
+        }
+
+        float desiredYaw(Vec3d feet, int index, LaunchLane lane) {
+            Vec3d target = target(index, lane);
+            Vec3d direction = new Vec3d(target.x - feet.x, 0, target.z - feet.z);
+            if (direction.lengthSquared() < 1.0E-8) direction = lane.heading();
+            return (float) Math.toDegrees(Math.atan2(-direction.x, direction.z));
+        }
+
+        double remainingDistance(int index, LaunchLane lane) {
+            if (index >= waypoints.size()) return 0;
+            double result = 0;
+            for (int i = index; i + 1 < waypoints.size(); i++) {
+                result += horizontalDistanceStatic(waypoints.get(i), waypoints.get(i + 1));
+            }
+            result += horizontalDistanceStatic(waypoints.getLast(), lane.landingAnchor().feet());
+            return result;
+        }
+
+        double crossTrackError(Vec3d feet, int index, LaunchLane lane) {
+            Vec3d destination = target(index, lane);
+            Vec3d origin = index == 0 ? lane.takeoffPoint()
+                    : index <= waypoints.size() ? waypoints.get(index - 1) : waypoints.getLast();
+            Vec3d segment = new Vec3d(destination.x - origin.x, 0, destination.z - origin.z);
+            if (segment.lengthSquared() < 1.0E-8) return horizontalDistanceStatic(feet, destination);
+            double t = MathHelper.clamp(new Vec3d(feet.x - origin.x, 0, feet.z - origin.z)
+                    .dotProduct(segment) / segment.lengthSquared(), 0, 1);
+            return horizontalDistanceStatic(feet, origin.add(segment.multiply(t)));
+        }
+
+        private static double horizontalDistanceStatic(Vec3d first, Vec3d second) {
+            return Math.hypot(first.x - second.x, first.z - second.z);
+        }
+    }
+    private record ObstacleNode(ParkourState state, LaunchState launch, ObstacleGuide guide,
+                                int guideIndex, ObstacleNode parent, ControlFrame input,
+                                int airTicks, String collisionSignature, double score) {}
     private record AirSchedule(boolean sprint, int forwardTicks, boolean brake,
                                float strafe, int strafeTicks, float yawOffset) {
         ControlFrame frame(int tick, LaunchLane lane, boolean takeoff) {
@@ -899,23 +1321,25 @@ public final class SearchPlanningSession implements PlanningSession {
         }
     }
     private record ObstacleStateKey(long x, long y, long z, long vx, long vy, long vz,
-                                    int yaw, boolean horizontal, boolean vertical, int lane) {
+                                    int yaw, boolean horizontal, boolean vertical,
+                                    int lane, int guide, int guideIndex) {
         static ObstacleStateKey from(ObstacleNode node) {
             ParkourState s = node.state;
             return new ObstacleStateKey(q(s.feetPosition().x, 0.04), q(s.feetPosition().y, 0.04),
                     q(s.feetPosition().z, 0.04), q(s.velocity().x, 0.025), q(s.velocity().y, 0.025),
                     q(s.velocity().z, 0.025), Math.round(s.yaw() / 4), s.horizontalCollision(),
-                    s.verticalCollision(), node.launch.lane().id());
+                    s.verticalCollision(), node.launch.lane().id(), node.guide.id(), node.guideIndex);
         }
     }
-    private record DiversityKey(int lane, int side, String collision, long touchdownX, long touchdownZ) {
+    private record DiversityKey(int lane, int guide, int guideIndex, int side,
+                                String collision, long touchdownX, long touchdownZ) {
         static DiversityKey from(ObstacleNode node) {
             LaunchLane lane = node.launch.lane();
             Vec3d sideAxis = ControlInput.strafeDirection(lane.heading());
             int side = (int) Math.signum(node.state.feetPosition().subtract(lane.takeoffPoint()).dotProduct(sideAxis));
             double ticks = Math.max(1, Math.min(16,
                     (node.state.feetPosition().y - lane.landingAnchor().feet().y + 1) / 0.08));
-            return new DiversityKey(lane.id(), side, node.collisionSignature,
+            return new DiversityKey(lane.id(), node.guide.id(), node.guideIndex, side, node.collisionSignature,
                     q(node.state.feetPosition().x + node.state.velocity().x * ticks, 0.25),
                     q(node.state.feetPosition().z + node.state.velocity().z * ticks, 0.25));
         }

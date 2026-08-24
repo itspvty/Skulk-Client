@@ -23,8 +23,6 @@ import java.util.List;
 
 /** Executes predicted controls against observed phases instead of elapsed client ticks. */
 public final class TrajectoryStepController implements StepController {
-    private static final double MAX_PRE_TAKEOFF_POSITION_ERROR = 0.25;
-    private static final double MAX_PRE_TAKEOFF_VELOCITY_ERROR = 0.12;
     private static final double AIRBORNE_POSITION_DEADBAND = 0.18;
     private static final double AIRBORNE_VELOCITY_DEADBAND = 0.10;
     private static final double AIRBORNE_VERTICAL_POSITION_DEADBAND = 0.16;
@@ -33,6 +31,8 @@ public final class TrajectoryStepController implements StepController {
     private static final float MAX_YAW_CHANGE = 12;
     private static final int MAX_SNEAK_TICKS = 6;
     private static final int MAX_ALIGNMENT_TICKS = 30;
+    private static final int MAX_TAKEOFF_LOOKAHEAD_TICKS = 8;
+    private static final double OBSTACLE_RECOVERY_CLEARANCE = 0.18;
 
     private final ParkourPhysics physics = new ParkourPhysics();
 
@@ -47,7 +47,9 @@ public final class TrajectoryStepController implements StepController {
     private int alignmentTicks;
     private int airborneMismatchTicks;
     private boolean launched;
-    private boolean jumpIssued;
+    private boolean jumpCommanded;
+    private ControlFrame pendingTakeoffFrame;
+    private double takeoffCommandFeetY;
     private boolean launchStaged;
     private boolean launchAligned;
     private boolean runUpStarted;
@@ -67,7 +69,9 @@ public final class TrajectoryStepController implements StepController {
         alignmentTicks = 0;
         airborneMismatchTicks = 0;
         launched = false;
-        jumpIssued = false;
+        jumpCommanded = false;
+        pendingTakeoffFrame = null;
+        takeoffCommandFeetY = 0;
         runUpStarted = false;
         // A validated current-state launch must apply its first input on the handoff tick.
         // Spending even one idle tick here changes velocity and invalidates the simulation.
@@ -88,7 +92,10 @@ public final class TrajectoryStepController implements StepController {
         }
 
         PlayerEntity player = client.player;
-        if (jumpIssued && !player.isOnGround()) launched = true;
+        if (jumpCommanded && !launched) {
+            StepTickResult pending = acknowledgeTakeoff(client, player);
+            if (pending != null) return pending;
+        }
         boolean targetSupported = targetSupported(player);
         if (!targetSupported) client.options.sneakKey.setPressed(false);
 
@@ -208,12 +215,12 @@ public final class TrajectoryStepController implements StepController {
 
     private StepTickResult executeTrajectory(MinecraftClient client, PlayerEntity player,
                                              boolean targetSupported) {
-        if (!player.isOnGround() && !jumpIssued) {
+        if (!player.isOnGround() && !launched) {
             release(client);
             return fail("Approach left its support before the planned jump transition.");
         }
         if (frameIndex >= plan.controlFrames().size()) {
-            if (!player.isOnGround() && jumpIssued) {
+            if (!player.isOnGround() && launched) {
                 ControlFrame recovery = runtimeAirborneControl(ParkourState.capture(PlayerSnapshot.capture(player)),
                         lastAirborneFrame(), plan.controlFrames().size() - 1);
                 applyFrame(client, player, recovery, false);
@@ -227,36 +234,37 @@ public final class TrajectoryStepController implements StepController {
         ControlFrame planned = plan.controlFrames().get(frameIndex);
         if (!planned.guard().permits(player.isOnGround(), targetSupported)) {
             if (!player.isOnGround()) {
+                if (!launched) {
+                    release(client);
+                    return fail("Approach left support without a confirmed jump impulse.");
+                }
                 ControlFrame recovery = runtimeAirborneControl(ParkourState.capture(PlayerSnapshot.capture(player)),
                         lastAirborneFrame(), frameIndex);
                 applyFrame(client, player, recovery, false);
                 launched = true;
                 return StepTickResult.RUNNING;
             }
-            if (jumpIssued && !launched && ++jumpWaitTicks <= 3) {
-                ControlFrame waiting = new ControlFrame(planned.forward(), planned.strafe(), planned.sprint(),
-                        false, false, planned.desiredYaw(), ControlPhase.TAKEOFF, FrameGuard.GROUNDED);
-                applyFrame(client, player, waiting, false);
-                return StepTickResult.RUNNING;
-            }
             release(client);
             return StepTickResult.RUNNING;
         }
 
-        TrajectorySample expected = plan.predictedTrajectory().get(
-                Math.min(frameIndex, plan.predictedTrajectory().size() - 1));
-        if (runUpStarted && !launched) {
-            double positionError = horizontalDistance(player.getPos(), expected.feetPosition());
-            double velocityError = player.getVelocity().subtract(expected.velocity()).horizontalLength();
-            if (positionError > MAX_PRE_TAKEOFF_POSITION_ERROR) {
-                return fail("Aborted before takeoff: position error exceeded 0.25 blocks.");
+        boolean jump = planned.jump() && !jumpCommanded && !launched;
+        if (jump && plan.launchLane() != null) {
+            TakeoffDecision decision = takeoffDecision(
+                    ParkourState.capture(PlayerSnapshot.capture(player)), planned, frameIndex);
+            if (decision == TakeoffDecision.ABORT) {
+                release(client);
+                return fail("No validated takeoff state remained before the safe edge.");
             }
-            if (velocityError > MAX_PRE_TAKEOFF_VELOCITY_ERROR) {
-                return fail("Aborted before takeoff: velocity error exceeded 0.12 blocks/tick.");
+            if (decision == TakeoffDecision.APPROACH) {
+                ControlFrame approach = new ControlFrame(1, planned.strafe(), planned.sprint(),
+                        false, false, planned.desiredYaw(), ControlPhase.RUN_UP, FrameGuard.GROUNDED);
+                applyFrame(client, player, approach, false);
+                runUpStarted = true;
+                return StepTickResult.RUNNING;
             }
         }
 
-        boolean jump = planned.jump() && !jumpIssued;
         if (jump && plan.launchLane() != null && !plan.launchLane().inTriggerInterval(player.getPos())) {
             double remaining = plan.launchLane().distanceBeforeEdge(player.getPos());
             if (remaining < plan.launchLane().triggerMinimum() - 0.05) {
@@ -275,10 +283,98 @@ public final class TrajectoryStepController implements StepController {
                     guarded, frameIndex) : guarded;
         applyFrame(client, player, corrected, false);
         runUpStarted |= corrected.phase() == ControlPhase.RUN_UP || corrected.phase() == ControlPhase.TAKEOFF;
-        if (jump) jumpIssued = true;
+        if (jump) {
+            // Command issuance is not takeoff acknowledgement. Keep this frame pending until
+            // Minecraft exposes upward motion (or the expected head-contact rise) next tick.
+            jumpCommanded = true;
+            pendingTakeoffFrame = corrected;
+            takeoffCommandFeetY = player.getY();
+            jumpWaitTicks = 0;
+            return StepTickResult.RUNNING;
+        }
         frameIndex++;
-        launched |= jumpIssued && !player.isOnGround();
         return StepTickResult.RUNNING;
+    }
+
+    private StepTickResult acknowledgeTakeoff(MinecraftClient client, PlayerEntity player) {
+        double verticalDisplacement = player.getY() - takeoffCommandFeetY;
+        if (isTakeoffConfirmed(player.isOnGround(), verticalDisplacement,
+                player.getVelocity().y, player.verticalCollision)) {
+            launched = true;
+            client.options.jumpKey.setPressed(false);
+            frameIndex++;
+            jumpWaitTicks = 0;
+            return null;
+        }
+        if (!player.isOnGround()) {
+            release(client);
+            return fail("Missed takeoff: the player walked off support without receiving a jump impulse.");
+        }
+        if (++jumpWaitTicks <= 2 && pendingTakeoffFrame != null
+                && plan.launchLane() != null
+                && plan.launchLane().inTriggerInterval(player.getPos())) {
+            applyFrame(client, player, pendingTakeoffFrame, false);
+            return StepTickResult.RUNNING;
+        }
+        release(client);
+        return fail("The jump command was not accepted inside the launch window.");
+    }
+
+    static boolean isTakeoffConfirmed(boolean onGround, double verticalDisplacement,
+                                      double verticalVelocity) {
+        return isTakeoffConfirmed(onGround, verticalDisplacement, verticalVelocity, false);
+    }
+
+    static boolean isTakeoffConfirmed(boolean onGround, double verticalDisplacement,
+                                      double verticalVelocity, boolean upwardCollision) {
+        return !onGround && (verticalDisplacement > 0.01 || verticalVelocity > 0.01
+                || upwardCollision && verticalDisplacement >= -0.001);
+    }
+
+    TakeoffDecision takeoffDecision(ParkourState observed, ControlFrame planned, int controlIndex) {
+        if (stableJumpRollout(observed, planned, controlIndex)) return TakeoffDecision.JUMP_NOW;
+
+        ParkourState probe = observed;
+        ControlFrame approach = new ControlFrame(1, planned.strafe(), planned.sprint(), false,
+                false, planned.desiredYaw(), ControlPhase.RUN_UP, FrameGuard.GROUNDED);
+        for (int tick = 0; tick < MAX_TAKEOFF_LOOKAHEAD_TICKS; tick++) {
+            try { probe = physics.tick(world, probe, boundedInput(probe, approach)); }
+            catch (RuntimeException exception) { return TakeoffDecision.ABORT; }
+            if (!probe.onGround() || plan.launchLane().distanceBeforeEdge(probe.feetPosition())
+                    < plan.launchLane().triggerMinimum() - 0.02) return TakeoffDecision.ABORT;
+            boolean supported = SupportResolver.overlapArea(probe.boundingBox(), probe.feetPosition().y,
+                    List.of(plan.launchLane().takeoffSurface())) > 1.0E-4;
+            if (stableJumpRollout(probe, planned, controlIndex)) {
+                return supported || maximumReachLane()
+                        ? TakeoffDecision.APPROACH : TakeoffDecision.ABORT;
+            }
+            // Ordinary and obstacle lanes may never deliberately advance into a supportless
+            // coyote state. Only a true maximum platform gap is allowed to search that exact
+            // retained-ground transition.
+            if (!supported && !maximumReachLane()) return TakeoffDecision.ABORT;
+        }
+        return TakeoffDecision.ABORT;
+    }
+
+    private boolean stableJumpRollout(ParkourState state, ControlFrame planned, int controlIndex) {
+        if (!state.onGround() || planned.sprint() && !state.sprinting()) return false;
+        if (plan.launchLane().distanceBeforeEdge(state.feetPosition())
+                < plan.launchLane().triggerMinimum() - 0.02) return false;
+        return recoveryScore(state, planned, controlIndex, 0).stableTarget();
+    }
+
+    private boolean maximumReachLane() {
+        if (plan.launchLane() == null) return false;
+        double gap = plan.landingRegion().stream().mapToDouble(surface -> edgeDistance(
+                plan.launchLane().takeoffSurface().footprint(), surface.footprint()))
+                .min().orElse(Double.MAX_VALUE);
+        return gap >= 3.75;
+    }
+
+    private double edgeDistance(net.minecraft.util.math.Box first, net.minecraft.util.math.Box second) {
+        double dx = Math.max(0, Math.max(first.minX - second.maxX, second.minX - first.maxX));
+        double dz = Math.max(0, Math.max(first.minZ - second.maxZ, second.minZ - first.maxZ));
+        return Math.hypot(dx, dz);
     }
 
     private StepTickResult tickLanding(MinecraftClient client, PlayerEntity player) {
@@ -357,9 +453,15 @@ public final class TrajectoryStepController implements StepController {
         TrajectorySample expected = expectedSample(controlIndex);
         ControlFrame nominal = airborneFrame(planned.forward(), planned.strafe(), planned.sprint(),
                 planned.desiredYaw());
-        if (!requiresAirborneRecovery(observed, expected)) {
+        boolean obstacleThreat = observed.horizontalCollision()
+                || bodyObstacleClearance(observed) < OBSTACLE_RECOVERY_CLEARANCE;
+        if (!requiresAirborneRecovery(observed, expected) && !obstacleThreat) {
             airborneMismatchTicks = 0;
             return nominal;
+        }
+        if (obstacleThreat) {
+            airborneMismatchTicks = 0;
+            return selectAirborneControl(observed, planned, controlIndex, true);
         }
         airborneMismatchTicks++;
         if (airborneMismatchTicks < 2 && !requiresImmediateAirborneRecovery(observed, expected)) {
@@ -369,28 +471,74 @@ public final class TrajectoryStepController implements StepController {
     }
 
     ControlFrame selectAirborneControl(ParkourState observed, ControlFrame planned, int controlIndex) {
+        return selectAirborneControl(observed, planned, controlIndex, false);
+    }
+
+    private ControlFrame selectAirborneControl(ParkourState observed, ControlFrame planned,
+                                               int controlIndex, boolean force) {
         TrajectorySample expected = plan.predictedTrajectory().get(Math.min(
                 Math.max(0, controlIndex), plan.predictedTrajectory().size() - 1));
         ControlFrame nominal = airborneFrame(planned.forward(), planned.strafe(), planned.sprint(),
                 planned.desiredYaw());
-        if (!requiresAirborneRecovery(observed, expected)) return nominal;
+        if (!force && !requiresAirborneRecovery(observed, expected)) return nominal;
 
         List<ControlFrame> choices = List.of(nominal,
                 airborneFrame(0, 0, false, nominal.desiredYaw()),
                 airborneFrame(-1, 0, false, nominal.desiredYaw()),
                 airborneFrame(nominal.forward(), -1, nominal.sprint(), nominal.desiredYaw()),
                 airborneFrame(nominal.forward(), 1, nominal.sprint(), nominal.desiredYaw()));
-        RecoveryOutcome plannedOutcome = recoveryScore(observed, choices.getFirst(), controlIndex, 0);
-        if (plannedOutcome.stableTarget()) return choices.getFirst();
-
+        RecoveryOutcome plannedOutcome = force
+                ? twoTickRecoveryScore(observed, choices.getFirst(), controlIndex, 0)
+                : recoveryScore(observed, choices.getFirst(), controlIndex, 0);
         ControlFrame best = choices.getFirst();
         double bestScore = plannedOutcome.score();
         for (int index = 1; index < choices.size(); index++) {
             ControlFrame choice = choices.get(index);
-            RecoveryOutcome outcome = recoveryScore(observed, choice, controlIndex, index);
+            RecoveryOutcome outcome = force
+                    ? twoTickRecoveryScore(observed, choice, controlIndex, index)
+                    : recoveryScore(observed, choice, controlIndex, index);
             if (outcome.score() < bestScore) { bestScore = outcome.score(); best = choice; }
         }
         return best;
+    }
+
+    /**
+     * Tight obstacle routes need a coordinated correction, not one alternate frame followed by
+     * the unchanged suffix. Evaluate one additional command and apply only the first result;
+     * this remains a small receding-horizon controller rather than an open-loop rewrite.
+     */
+    private RecoveryOutcome twoTickRecoveryScore(ParkourState start, ControlFrame first,
+                                                   int controlIndex, int preference) {
+        ParkourState afterFirst;
+        try { afterFirst = physics.tick(world, start, boundedInput(start, first)); }
+        catch (RuntimeException exception) { return new RecoveryOutcome(Double.MAX_VALUE, false); }
+        if (afterFirst.onGround()) return recoveryScore(start, first, controlIndex, preference);
+
+        ControlFrame nextPlanned = nextAirborneFrame(controlIndex + 1);
+        List<ControlFrame> secondChoices = List.of(nextPlanned,
+                airborneFrame(0, 0, false, nextPlanned.desiredYaw()),
+                airborneFrame(-1, 0, false, nextPlanned.desiredYaw()),
+                airborneFrame(nextPlanned.forward(), -1, nextPlanned.sprint(), nextPlanned.desiredYaw()),
+                airborneFrame(nextPlanned.forward(), 1, nextPlanned.sprint(), nextPlanned.desiredYaw()));
+        RecoveryOutcome best = new RecoveryOutcome(Double.MAX_VALUE, false);
+        for (int index = 0; index < secondChoices.size(); index++) {
+            RecoveryOutcome outcome = recoveryScore(afterFirst, secondChoices.get(index),
+                    controlIndex + 1, preference * 10 + index);
+            outcome = new RecoveryOutcome(outcome.score() + obstacleRisk(afterFirst),
+                    outcome.stableTarget());
+            if (outcome.score() < best.score()) best = outcome;
+        }
+        return best;
+    }
+
+    private ControlFrame nextAirborneFrame(int index) {
+        for (int cursor = Math.max(0, index); cursor < plan.controlFrames().size(); cursor++) {
+            ControlFrame frame = plan.controlFrames().get(cursor);
+            if (frame.phase() == ControlPhase.AIRBORNE) {
+                return airborneFrame(frame.forward(), frame.strafe(), frame.sprint(), frame.desiredYaw());
+            }
+        }
+        return airborneFrame(0, 0, false, plan.launchEnvelope().desiredYaw());
     }
 
     private RecoveryOutcome recoveryScore(ParkourState start, ControlFrame first,
@@ -401,6 +549,7 @@ public final class TrajectoryStepController implements StepController {
         int cursor = Math.max(0, controlIndex + 1);
         int groundedTargetTicks = 0;
         int slowTargetTicks = 0;
+        double obstacleRisk = obstacleRisk(state);
         double score = state.feetPosition().squaredDistanceTo(expectedSample(cursor).feetPosition()) * 0.25;
         for (int tick = 0; tick < RECOVERY_HORIZON_TICKS; tick++) {
             boolean target = SupportResolver.targetSupported(state.boundingBox(), state.feetPosition(),
@@ -418,7 +567,7 @@ public final class TrajectoryStepController implements StepController {
                     double margin = SupportResolver.edgeMargin(state.boundingBox(), state.feetPosition().y,
                             plan.landingRegion());
                     return new RecoveryOutcome(-1_000_000 - margin * 1_000
-                            + state.velocity().horizontalLength() * 100 + preference, true);
+                            + state.velocity().horizontalLength() * 100 + preference + obstacleRisk, true);
                 }
             }
 
@@ -439,6 +588,7 @@ public final class TrajectoryStepController implements StepController {
             }
             try { state = physics.tick(world, state, boundedInput(state, continuation)); }
             catch (RuntimeException exception) { return new RecoveryOutcome(Double.MAX_VALUE, false); }
+            obstacleRisk += obstacleRisk(state);
             if (state.feetPosition().y < plan.settleAnchor().y - 4) {
                 return new RecoveryOutcome(2_000_000 + preference, false);
             }
@@ -453,7 +603,27 @@ public final class TrajectoryStepController implements StepController {
             score += state.velocity().horizontalLength() * 80;
         } else score += SupportResolver.distanceToRegion(state.feetPosition(), plan.landingRegion()) * 500;
         score += horizontalDistance(state.feetPosition(), plan.settleAnchor()) * 20 + preference * 0.01;
-        return new RecoveryOutcome(score, false);
+        return new RecoveryOutcome(score + obstacleRisk, false);
+    }
+
+    private double obstacleRisk(ParkourState state) {
+        double clearance = bodyObstacleClearance(state);
+        return (state.horizontalCollision() ? 5_000 : 0)
+                + Math.max(0, 0.22 - clearance) * 2_000;
+    }
+
+    private double bodyObstacleClearance(ParkourState state) {
+        double minimum = 10;
+        for (var obstacle : world.collisionBoxes(state.boundingBox().expand(0.35))) {
+            if (obstacle.maxY <= state.feetPosition().y + 0.05
+                    || obstacle.minY >= state.boundingBox().maxY - 0.05) continue;
+            double dx = Math.max(0, Math.max(obstacle.minX - state.boundingBox().maxX,
+                    state.boundingBox().minX - obstacle.maxX));
+            double dz = Math.max(0, Math.max(obstacle.minZ - state.boundingBox().maxZ,
+                    state.boundingBox().minZ - obstacle.maxZ));
+            minimum = Math.min(minimum, Math.hypot(dx, dz));
+        }
+        return minimum;
     }
 
     private ControlFrame projectedStoppingFrame(ParkourState state) {
@@ -569,4 +739,5 @@ public final class TrajectoryStepController implements StepController {
     private record LandingOutcome(ControlFrame frame, int supportedTicks,
                                   double finalSpeed, int preference) {}
     private record RecoveryOutcome(double score, boolean stableTarget) {}
+    enum TakeoffDecision { JUMP_NOW, APPROACH, ABORT }
 }

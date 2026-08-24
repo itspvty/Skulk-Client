@@ -36,23 +36,61 @@ class JumpProblemAnalyzerTest {
         assertEquals(0, diagonal.landingRegion().getFirst().topY(), 0.001);
     }
 
-    @Test void preservesOneBlockRiseAndEdgeDistanceBounds() {
+    @Test void delegatesVerticalReachToPhysicsAndPreservesEdgeDistanceBounds() {
         ShapeWorld rise = runwayAndGap();
         rise.support(2, 0, 0, 1);
         assertInstanceOf(JumpProblemResult.Valid.class,
                 analyzer.analyzeProblem(rise, player, new BlockPos(2, 0, 0)));
 
+        ShapeWorld partialRise = runwayAndGap();
+        partialRise.support(2, 0, 0, 1.2522);
+        JumpProblem problem = assertInstanceOf(JumpProblemResult.Valid.class,
+                analyzer.analyzeProblem(partialRise, player, new BlockPos(2, 0, 0))).problem();
+        assertEquals(1.2522, problem.landingRegion().getFirst().topY(), 1.0E-6);
+
         ShapeWorld high = runwayAndGap();
         high.support(2, 1, 0, 1);
-        JumpProblemResult.Rejected tooHigh = assertInstanceOf(JumpProblemResult.Rejected.class,
-                analyzer.analyzeProblem(high, player, new BlockPos(2, 1, 0)));
-        assertEquals(JumpRejectionReason.TOO_HIGH, tooHigh.reason());
+        assertInstanceOf(JumpProblemResult.Valid.class,
+                analyzer.analyzeProblem(high, player, new BlockPos(2, 1, 0)),
+                "Analysis must not reject vertical geometry before production physics evaluates it.");
 
         ShapeWorld far = runwayAndGap();
         far.support(7, -1, 0, 1);
         JumpProblemResult.Rejected tooFar = assertInstanceOf(JumpProblemResult.Rejected.class,
                 analyzer.analyzeProblem(far, player, new BlockPos(7, -1, 0)));
         assertEquals(JumpRejectionReason.TOO_FAR, tooFar.reason());
+    }
+
+    @Test void keepsTheRunwayBehindTheOnlyDistanceLegalFourBlockTakeoff() {
+        ShapeWorld world = runwayAndGap();
+        world.support(5, -1, 0, 1);
+
+        JumpProblem problem = valid(world, new BlockPos(5, -1, 0));
+
+        assertEquals(1, problem.reachableTakeoffs().size());
+        assertEquals(new BlockPos(0, -1, 0), problem.reachableTakeoffs().getFirst().block());
+        assertEquals(4, problem.approachRegion().size());
+    }
+
+    @Test void downwardTargetsAreNotRejectedByTheLevelJumpDistanceLimit() {
+        ShapeWorld world = runwayAndGap();
+        world.support(7, -2, 0, 1);
+
+        JumpProblem problem = valid(world, new BlockPos(7, -2, 0));
+
+        assertEquals(-1, problem.landingRegion().getFirst().topY(), 0.001);
+        assertFalse(problem.reachableTakeoffs().isEmpty());
+    }
+
+    @Test void lowerReachableFloorDoesNotFloodTheFlatApproachRunway() {
+        ShapeWorld world = runwayAndGap();
+        world.support(5, -1, 0, 1);
+        for (int x = -3; x <= 7; x++) world.support(x, -3, 1, 1);
+
+        JumpProblem problem = valid(world, new BlockPos(5, -1, 0));
+
+        assertEquals(4, problem.approachRegion().size());
+        assertTrue(problem.approachRegion().stream().allMatch(surface -> surface.topY() == 0));
     }
 
     @Test void rejectsWalkOnlyFluidClimbableAndBlockedStandingRoutes() {

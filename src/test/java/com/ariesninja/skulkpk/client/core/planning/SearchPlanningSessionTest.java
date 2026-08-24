@@ -4,6 +4,9 @@ import com.ariesninja.skulkpk.client.core.analysis.JumpProblem;
 import com.ariesninja.skulkpk.client.core.analysis.PlayerSnapshot;
 import com.ariesninja.skulkpk.client.core.analysis.StandableSurface;
 import com.ariesninja.skulkpk.client.core.physics.InMemoryPhysicsWorld;
+import com.ariesninja.skulkpk.client.core.physics.ControlInput;
+import com.ariesninja.skulkpk.client.core.physics.ParkourPhysics;
+import com.ariesninja.skulkpk.client.core.physics.ParkourState;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Vec3d;
@@ -32,16 +35,107 @@ class SearchPlanningSessionTest {
         }
     }
 
-    @Test void fourBlockJumpFromOneTakeoffBlockUsesTheWholeLegalRunway() {
-        InMemoryPhysicsWorld world = new InMemoryPhysicsWorld().floor(0, 0, 0).floor(4, 0, 0);
-        List<StandableSurface> takeoffs = List.of(surface(0, 0));
-        List<StandableSurface> landing = List.of(surface(4, 0));
-        Vec3d feet = new Vec3d(0.31, 0, 0.5);
-        MovementPlan plan = ready(new SearchPlanningSession(customRequest(world, takeoffs, landing, feet, -90)));
+    @Test void trueFourBlockEdgeGapUsesRunwayBehindTheOnlyLegalTakeoff() {
+        InMemoryPhysicsWorld world = new InMemoryPhysicsWorld();
+        List<StandableSurface> approach = new ArrayList<>();
+        for (int x = -3; x <= 0; x++) {
+            world.floor(x, 0, 0);
+            approach.add(surface(x, 0));
+        }
+        world.floor(5, 0, 0);
+        List<StandableSurface> legalTakeoffs = List.of(surface(0, 0));
+        List<StandableSurface> landing = List.of(surface(5, 0));
+        Vec3d feet = new Vec3d(-1.5, 0, 0.5);
+        MovementPlan plan = ready(new SearchPlanningSession(customRequest(world, legalTakeoffs,
+                approach, landing, feet, -90, PlanningPolicy.AGGRESSIVE)));
         assertEquals(PlanningStage.DIRECT, plan.planningStage());
         assertTrue(plan.metrics().directNanos() < 200_000_000L);
+        assertTrue(plan.metrics().searchNanos() <= PlanningPolicy.AGGRESSIVE.maximumWallNanos());
         assertEquals(SupportKind.TARGET, plan.predictedTrajectory().getLast().support());
+        assertTrue(plan.metrics().runUpLength() >= 1.0);
         assertTrue(plan.controlFrames().stream().anyMatch(frame -> frame.sprint() && frame.jump()));
+        assertTrue(plan.predictedTrajectory().stream().anyMatch(sample -> sample.onGround()
+                && sample.support() == SupportKind.NONE && sample.phase() == ControlPhase.RUN_UP));
+    }
+
+    @Test void trueFourBlockDirectRouteIsNotStarvedByReachableFloorBelowTheCourse() {
+        InMemoryPhysicsWorld world = new InMemoryPhysicsWorld();
+        for (int x = -3; x <= 0; x++) world.floor(x, 0, 0);
+        world.floor(5, 0, 0);
+        for (int x = -10; x <= 10; x++) for (int z = 1; z <= 10; z++) {
+            world.floor(x, z, -2);
+        }
+        Vec3d feet = new Vec3d(-1.5, 0, 0.5);
+        PlayerSnapshot player = new PlayerSnapshot(feet, box(feet), Vec3d.ZERO, -90,
+                true, false, false, 0.1, 0.42, 0.6, Map.of());
+        var analyzed = assertInstanceOf(
+                com.ariesninja.skulkpk.client.core.analysis.JumpProblemResult.Valid.class,
+                new com.ariesninja.skulkpk.client.core.JumpAnalyzer().analyzeProblem(
+                        world, player, new BlockPos(5, -1, 0)));
+        assertEquals(4, analyzed.problem().approachRegion().size());
+
+        MovementPlan plan = ready(new SearchPlanningSession(new PlanningRequest(world, player,
+                analyzed.problem().selectedBlock(), PlanningPolicy.AGGRESSIVE, analyzed.problem())));
+
+        assertEquals(PlanningStage.DIRECT, plan.planningStage());
+        assertEquals(SupportKind.TARGET, plan.predictedTrajectory().getLast().support());
+        assertFalse(plan.landingZone().isCore(
+                plan.predictedTrajectory().stream().filter(sample -> sample.support() == SupportKind.TARGET)
+                        .findFirst().orElseThrow().boundingBox(),
+                plan.predictedTrajectory().stream().filter(sample -> sample.support() == SupportKind.TARGET)
+                        .findFirst().orElseThrow().feetPosition()),
+                "Maximum reach should accept the first stable fringe contact without a safety inset.");
+    }
+
+    @Test void shiftedFourBlockTargetUsesTheNearestTakeoffAndLandingEdges() {
+        InMemoryPhysicsWorld world = new InMemoryPhysicsWorld();
+        List<StandableSurface> approach = new ArrayList<>();
+        for (int x = -3; x <= 0; x++) {
+            world.floor(x, 0, 0);
+            approach.add(surface(x, 0, 0));
+        }
+        world.floor(5, 1, 0);
+        StandableSurface landing = surface(5, 1, 0);
+        Vec3d feet = new Vec3d(-1.5, 0, 0.5);
+        LandingZone zone = LandingZone.build(List.of(landing), new PlayerSnapshot(feet));
+        assertTrue(zone.fringeAnchors().stream().mapToDouble(anchor -> anchor.feet().z).min().orElse(2) <= 0.80,
+                "The landing zone must preserve its nearest legal fringe: " + zone.fringeAnchors());
+        assertTrue(bruteShiftedReach(world, List.of(landing), feet),
+                "Production physics should contain at least one shifted maximum-reach family.");
+
+        MovementPlan plan = ready(new SearchPlanningSession(customRequest(world,
+                List.of(surface(0, 0, 0)), approach, List.of(landing), feet, -90,
+                PlanningPolicy.AGGRESSIVE)));
+
+        assertEquals(PlanningStage.DIRECT, plan.planningStage());
+        assertEquals(SupportKind.TARGET, plan.predictedTrajectory().getLast().support());
+        assertTrue(plan.launchLane().takeoffPoint().z > 0.60,
+                "The shifted target should use the near lateral edge of the runway.");
+        assertTrue(plan.launchLane().landingAnchor().feet().z < 1.50,
+                "The shifted target should use its near landing edge instead of its center.");
+        assertTrue(plan.launchLane().triggerMinimum() <= -0.90,
+                "Only maximum-gap geometry should retain the measured coyote launch window.");
+    }
+
+    @Test void partialBlockRiseIsAcceptedOnlyAfterProductionPhysicsFindsAStableRoute() {
+        InMemoryPhysicsWorld world = new InMemoryPhysicsWorld();
+        List<StandableSurface> approach = new ArrayList<>();
+        for (int x = -3; x <= 0; x++) {
+            world.floor(x, 0, 0);
+            approach.add(surface(x, 0, 0));
+        }
+        double targetTop = 1.2522;
+        world.floor(2, 0, targetTop);
+        StandableSurface landing = new StandableSurface(new BlockPos(2, 0, 0),
+                new Box(2, targetTop - 1, 0, 3, targetTop, 1), targetTop);
+        Vec3d feet = new Vec3d(-1.5, 0, 0.5);
+
+        MovementPlan plan = ready(new SearchPlanningSession(customRequest(world,
+                List.of(surface(0, 0, 0)), approach, List.of(landing), feet, -90,
+                PlanningPolicy.AGGRESSIVE)));
+
+        assertEquals(SupportKind.TARGET, plan.predictedTrajectory().getLast().support());
+        assertEquals(targetTop, plan.predictedTrajectory().getLast().feetPosition().y, 1.0E-6);
     }
 
     @Test void shortCurrentStateJumpSkipsPositioningAndUsesCenteredCoreLanding() {
@@ -64,6 +158,18 @@ class SearchPlanningSessionTest {
         MovementPlan platformPlan = ready(new SearchPlanningSession(connected));
         assertEquals(3, platformPlan.landingRegion().size());
         assertEquals(platformPlan.settleAnchor(), platformPlan.launchLane().landingAnchor().feet());
+    }
+
+    @Test void threeBlockOneRiseUsesAProductionBudgetMomentumLaunch() {
+        MovementPlan plan = ready(new SearchPlanningSession(request(3, 1, -90,
+                PlanningPolicy.AGGRESSIVE, false)));
+
+        assertEquals(PlanningStage.DIRECT, plan.planningStage());
+        assertTrue(plan.metrics().searchNanos() <= PlanningPolicy.AGGRESSIVE.maximumWallNanos());
+        assertTrue(plan.controlFrames().stream().anyMatch(frame -> frame.jump() && frame.sprint()));
+        assertTrue(plan.controlFrames().stream().filter(frame -> frame.phase() == ControlPhase.RUN_UP)
+                .anyMatch(ControlFrame::sprint));
+        assertEquals(SupportKind.TARGET, plan.predictedTrajectory().getLast().support());
     }
 
     @Test void wrongYawKeepsOneFixedHeadingAndDoesNotInventImmediateAlignment() {
@@ -98,12 +204,109 @@ class SearchPlanningSessionTest {
         world.floor(2, 0, 0).box(new Box(0, 2.0, 0, 1.35, 2.25, 1));
         List<StandableSurface> landing = List.of(surface(2, 0));
         Vec3d feet = new Vec3d(0.5, 0, 0.5);
-        MovementPlan plan = ready(new SearchPlanningSession(customRequest(world, takeoffs, landing, feet, -90)));
+        MovementPlan plan = ready(new SearchPlanningSession(customRequest(world, takeoffs, landing,
+                feet, -90, PlanningPolicy.AGGRESSIVE)));
         assertTrue(plan.predictedTrajectory().stream().anyMatch(TrajectorySample::verticalCollision));
+        assertTrue(plan.controlFrames().stream().anyMatch(frame -> frame.jump() && frame.sprint()));
+        assertTrue(plan.controlFrames().stream().anyMatch(frame -> frame.phase() == ControlPhase.RUN_UP
+                && frame.sprint()));
         assertEquals(SupportKind.TARGET, plan.predictedTrajectory().getLast().support());
     }
 
-    @Test void cornerObstacleRouteRetainsUsefulSideContactOrLateralFlight() {
+    @Test void suppliedMapHeadhitterUsesTheLastSprintTickUnderTheCeiling() {
+        InMemoryPhysicsWorld world = new InMemoryPhysicsWorld();
+        List<StandableSurface> approach = new ArrayList<>();
+        for (int z = 1; z <= 2; z++) {
+            world.floor(0, z, 0);
+            approach.add(surface(0, z, 0));
+        }
+        List<StandableSurface> landing = new ArrayList<>();
+        for (int z = -3; z <= -1; z++) {
+            world.floor(0, z, 0);
+            landing.add(surface(0, z, 0));
+        }
+        world.box(new Box(0, 2, 0, 1, 3, 1));
+        Vec3d feet = new Vec3d(0.5, 0, 2.5);
+        MovementPlan plan = ready(new SearchPlanningSession(customRequest(world, approach,
+                approach, landing, feet, 180, PlanningPolicy.AGGRESSIVE)));
+
+        assertEquals(PlanningStage.DIRECT, plan.planningStage());
+        assertTrue(plan.predictedTrajectory().stream().anyMatch(TrajectorySample::verticalCollision));
+        assertTrue(plan.controlFrames().stream().anyMatch(frame -> frame.phase() == ControlPhase.RUN_UP
+                && frame.sprint()));
+        assertTrue(plan.controlFrames().stream().anyMatch(frame -> frame.jump() && frame.sprint()));
+        assertEquals(SupportKind.TARGET, plan.predictedTrajectory().getLast().support());
+    }
+
+    @Test void suppliedMapNeoRoutesAroundAFullHeightColumn() {
+        InMemoryPhysicsWorld world = new InMemoryPhysicsWorld();
+        List<StandableSurface> approach = new ArrayList<>();
+        for (int z = 0; z <= 2; z++) {
+            world.floor(0, z, 0);
+            approach.add(surface(0, z, 0));
+        }
+        List<StandableSurface> landing = new ArrayList<>();
+        for (int z = -3; z <= -2; z++) {
+            world.floor(0, z, 0);
+            landing.add(surface(0, z, 0));
+        }
+        world.floor(0, -1, 0).box(new Box(0, 0, -1, 1, 2, 0));
+        Vec3d feet = new Vec3d(0.5, 0, 1.5);
+        MovementPlan plan = ready(new SearchPlanningSession(customRequest(world,
+                List.of(surface(0, 0, 0)), approach, landing, feet, 180,
+                PlanningPolicy.AGGRESSIVE)));
+
+        assertEquals(PlanningStage.OBSTACLE, plan.planningStage());
+        assertTrue(plan.metrics().searchNanos() <= PlanningPolicy.AGGRESSIVE.maximumWallNanos());
+        assertEquals(SupportKind.TARGET, plan.predictedTrajectory().getLast().support());
+        assertTrue(plan.controlFrames().stream().anyMatch(frame -> frame.phase() == ControlPhase.RUN_UP
+                && Math.abs(frame.strafe()) > 0.1));
+        assertTrue(plan.takeoffPosition().z > 0.60,
+                "The neo should jump before reaching the pillar-adjacent exposed edge.");
+        assertTrue(plan.predictedTrajectory().stream().noneMatch(TrajectorySample::horizontalCollision));
+        Box pillar = new Box(0, 0, -1, 1, 2, 0);
+        double clearance = plan.predictedTrajectory().stream()
+                .filter(sample -> sample.boundingBox().maxY > pillar.minY
+                        && sample.boundingBox().minY < pillar.maxY)
+                .mapToDouble(sample -> horizontalGap(sample.boundingBox(), pillar))
+                .min().orElse(1);
+        assertTrue(clearance >= 0.08, "pillar clearance=" + clearance);
+        assertTrue(plan.predictedTrajectory().stream().anyMatch(sample ->
+                Math.abs(sample.feetPosition().x - 0.5) > 0.82));
+    }
+
+    @Test void oneBlockNeoUsesAnEarlyClearanceLaneInsteadOfThePillarEdge() {
+        InMemoryPhysicsWorld world = new InMemoryPhysicsWorld();
+        List<StandableSurface> approach = new ArrayList<>();
+        for (int z = 0; z <= 2; z++) {
+            world.floor(0, z, 0);
+            approach.add(surface(0, z, 0));
+        }
+        StandableSurface landing = surface(0, -2, 0);
+        world.floor(0, -2, 0).floor(0, -1, 0)
+                .box(new Box(0, 0, -1, 1, 3, 0));
+        Vec3d feet = new Vec3d(0.5, 0, 1.5);
+
+        MovementPlan plan = ready(new SearchPlanningSession(customRequest(world,
+                List.of(surface(0, 0, 0)), approach, List.of(landing), feet, 180,
+                PlanningPolicy.AGGRESSIVE)));
+
+        assertEquals(PlanningStage.OBSTACLE, plan.planningStage());
+        assertTrue(plan.takeoffPosition().z > 0.60);
+        assertTrue(plan.launchLane().triggerMinimum() >= -0.121,
+                "A neo must commit before walking beyond its early supported launch lane.");
+        assertTrue(plan.predictedTrajectory().stream().noneMatch(TrajectorySample::horizontalCollision));
+        assertEquals(SupportKind.TARGET, plan.predictedTrajectory().getLast().support());
+        Box pillar = new Box(0, 0, -1, 1, 3, 0);
+        double clearance = plan.predictedTrajectory().stream()
+                .filter(sample -> sample.boundingBox().maxY > pillar.minY
+                        && sample.boundingBox().minY < pillar.maxY)
+                .mapToDouble(sample -> horizontalGap(sample.boundingBox(), pillar))
+                .min().orElse(1);
+        assertTrue(clearance >= 0.08, "pillar clearance=" + clearance);
+    }
+
+    @Test void cornerObstacleRouteRetainsUsefulSideContactOrLateralFlightWithinProductionBudget() {
         InMemoryPhysicsWorld world = new InMemoryPhysicsWorld();
         List<StandableSurface> takeoffs = new ArrayList<>();
         for (int x = -2; x <= 0; x++) { world.floor(x, 0, 0); takeoffs.add(surface(x, 0)); }
@@ -112,7 +315,8 @@ class SearchPlanningSessionTest {
                 new Box(1, -1, 1, 2, 0, 2), 0);
         Vec3d feet = new Vec3d(0.5, 0, 0.5);
         MovementPlan plan = ready(new SearchPlanningSession(customRequest(world, takeoffs,
-                List.of(target), feet, -45)));
+                List.of(target), feet, -45, PlanningPolicy.AGGRESSIVE)));
+        assertTrue(plan.metrics().searchNanos() <= PlanningPolicy.AGGRESSIVE.maximumWallNanos());
         assertEquals(SupportKind.TARGET, plan.predictedTrajectory().getLast().support());
         assertTrue(plan.predictedTrajectory().stream().anyMatch(sample -> sample.horizontalCollision()
                 || Math.abs(sample.feetPosition().z - 0.5) > 0.35));
@@ -178,19 +382,81 @@ class SearchPlanningSessionTest {
 
     private PlanningRequest customRequest(InMemoryPhysicsWorld world, List<StandableSurface> takeoffs,
                                           List<StandableSurface> landing, Vec3d feet, float yaw) {
+        return customRequest(world, takeoffs, landing, feet, yaw, TEST_POLICY);
+    }
+
+    private PlanningRequest customRequest(InMemoryPhysicsWorld world, List<StandableSurface> takeoffs,
+                                          List<StandableSurface> landing, Vec3d feet, float yaw,
+                                          PlanningPolicy policy) {
+        return customRequest(world, takeoffs, takeoffs, landing, feet, yaw, policy);
+    }
+
+    private PlanningRequest customRequest(InMemoryPhysicsWorld world,
+                                          List<StandableSurface> legalTakeoffs,
+                                          List<StandableSurface> approach,
+                                          List<StandableSurface> landing, Vec3d feet, float yaw,
+                                          PlanningPolicy policy) {
         PlayerSnapshot player = new PlayerSnapshot(feet, box(feet), Vec3d.ZERO, yaw,
                 true, false, false, 0.1, 0.42, 0.6, Map.of());
-        JumpProblem problem = new JumpProblem(landing.getFirst().block(), takeoffs.getLast(), landing,
-                takeoffs, world.boxes(), player, 11);
-        return new PlanningRequest(world, player, landing.getFirst().block(), TEST_POLICY, problem);
+        JumpProblem problem = new JumpProblem(landing.getFirst().block(), approach.getLast(), landing,
+                legalTakeoffs, approach, world.boxes(), player, 11);
+        return new PlanningRequest(world, player, landing.getFirst().block(), policy, problem);
     }
 
     private static StandableSurface surface(int x, int topY) {
-        return new StandableSurface(new BlockPos(x, topY - 1, 0),
-                new Box(x, topY - 1, 0, x + 1, topY, 1), topY);
+        return surface(x, 0, topY);
+    }
+    private static StandableSurface surface(int x, int z, int topY) {
+        return new StandableSurface(new BlockPos(x, topY - 1, z),
+                new Box(x, topY - 1, z, x + 1, topY, z + 1), topY);
     }
     private static Box box(Vec3d feet) {
         return new Box(feet.x - 0.3, feet.y, feet.z - 0.3,
                 feet.x + 0.3, feet.y + 1.8, feet.z + 0.3);
+    }
+    private static double horizontalGap(Box first, Box second) {
+        double dx = Math.max(0, Math.max(second.minX - first.maxX, first.minX - second.maxX));
+        double dz = Math.max(0, Math.max(second.minZ - first.maxZ, first.minZ - second.maxZ));
+        return Math.hypot(dx, dz);
+    }
+
+    private boolean bruteShiftedReach(InMemoryPhysicsWorld world, List<StandableSurface> landing,
+                                      Vec3d feet) {
+        ParkourPhysics physics = new ParkourPhysics();
+        PlayerSnapshot snapshot = new PlayerSnapshot(feet, box(feet), Vec3d.ZERO, -90,
+                true, false, false, 0.1, 0.42, 0.6, Map.of());
+        for (float yaw = -90; yaw <= -78; yaw += 1) {
+            ParkourState ground = ParkourState.at(snapshot, feet, Vec3d.ZERO, yaw, true, false);
+            for (int launchTick = 0; launchTick < 20; launchTick++) {
+                for (int release = 3; release <= 14; release++) {
+                    ParkourState flight = physics.tick(world, ground,
+                            new ControlInput(1, 0, true, true, false, yaw));
+                    boolean airborne = !flight.onGround();
+                    for (int tick = 1; tick < 60; tick++) {
+                        if (airborne && flight.onGround()) {
+                            if (SupportResolver.targetSupported(flight.boundingBox(),
+                                    flight.feetPosition(), true, landing)) {
+                                boolean stable = true;
+                                for (int settle = 0; settle < 14; settle++) {
+                                    flight = physics.tick(world, flight, new ControlInput(
+                                            0, 0, false, false, true, yaw));
+                                    stable &= SupportResolver.targetSupported(flight.boundingBox(),
+                                            flight.feetPosition(), flight.onGround(), landing);
+                                }
+                                if (stable) return true;
+                            }
+                            break;
+                        }
+                        flight = physics.tick(world, flight, new ControlInput(
+                                tick < release ? 1 : -1, 0, true, false, false, yaw));
+                        airborne |= !flight.onGround();
+                    }
+                }
+                ground = physics.tick(world, ground, new ControlInput(1, 0, true,
+                        false, false, yaw));
+                if (!ground.onGround()) break;
+            }
+        }
+        return false;
     }
 }
