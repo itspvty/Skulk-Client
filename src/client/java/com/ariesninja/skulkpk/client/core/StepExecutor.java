@@ -3,6 +3,7 @@ package com.ariesninja.skulkpk.client.core;
 import com.ariesninja.skulkpk.client.core.analysis.JumpProblem;
 import com.ariesninja.skulkpk.client.core.analysis.JumpProblemResult;
 import com.ariesninja.skulkpk.client.core.analysis.MinecraftWorldView;
+import com.ariesninja.skulkpk.client.core.analysis.PlayerSnapshot;
 import com.ariesninja.skulkpk.client.core.analysis.WorldView;
 import com.ariesninja.skulkpk.client.core.execution.ExecutionState;
 import com.ariesninja.skulkpk.client.core.execution.ExecutionStatus;
@@ -14,7 +15,9 @@ import com.ariesninja.skulkpk.client.core.planning.PlanningPolicy;
 import com.ariesninja.skulkpk.client.core.planning.PlanningRequest;
 import com.ariesninja.skulkpk.client.core.planning.PlanningSession;
 import com.ariesninja.skulkpk.client.core.planning.PlanningTickResult;
-import com.ariesninja.skulkpk.client.core.planning.SearchPlanningSession;
+import com.ariesninja.skulkpk.client.core.planning.AsyncPlanningSession;
+import com.ariesninja.skulkpk.client.core.planning.SupportKind;
+import com.ariesninja.skulkpk.client.core.planning.SupportResolver;
 import com.ariesninja.skulkpk.client.core.rendering.SelectionRenderer;
 import com.ariesninja.skulkpk.client.core.utils.ChatMessageUtil;
 import net.minecraft.client.MinecraftClient;
@@ -69,7 +72,11 @@ public final class StepExecutor {
         planningWorld = new MinecraftWorldView(client.world);
         PlanningRequest request = new PlanningRequest(planningWorld, planningProblem.player(),
                 planningProblem.selectedBlock(), PlanningPolicy.AGGRESSIVE, planningProblem);
-        planningSession = new SearchPlanningSession(request);
+        try { planningSession = new AsyncPlanningSession(request, problemBounds()); }
+        catch (IllegalArgumentException exception) {
+            finish(ExecutionState.FAILED, exception.getMessage(), client);
+            return false;
+        }
         activePlan = null;
         executionTicks = 0;
         reason = "";
@@ -111,6 +118,7 @@ public final class StepExecutor {
             return;
         }
         activePlan = ((PlanningTickResult.Ready) result).plan();
+        if (planningSession instanceof AsyncPlanningSession isolated) planningWorld = isolated.executionWorld();
         SelectionRenderer.setMovementPlan(activePlan);
         controller.start(activePlan, planningWorld);
         executionTicks = 0;
@@ -119,17 +127,23 @@ public final class StepExecutor {
         LOGGER.info("plan_ready target={} stage={} searchMs={} directMs={} obstacleMs={} validationMs={} "
                         + "launchStates={} flightStates={} deduplicated={} diversityBuckets={} coreTouchdowns={} "
                         + "fringeTouchdowns={} runUp={} landingSpeed={} robustness={} edgeMargin={} stopping={} "
-                        + "sneak={} termination={}",
+                        + "sneak={} route={} contacts={} latencyTicks={} validatedVariants={} "
+                        + "positionTolerance={} velocityTolerance={} yawTolerance={} termination={}",
                 planningProblem.selectedBlock().toShortString(), metrics.planningStage(),
                 metrics.searchNanos() / 1_000_000.0, metrics.directNanos() / 1_000_000.0,
                 metrics.obstacleNanos() / 1_000_000.0, metrics.landingValidationNanos() / 1_000_000.0,
                 metrics.launchSeeds(), metrics.flightStatesExpanded(), metrics.statesDeduplicated(),
                 metrics.diversityBuckets(), metrics.coreTouchdowns(), metrics.fringeTouchdowns(), metrics.runUpLength(),
                 metrics.landingSpeed(), metrics.robustnessScore(), metrics.edgeMargin(),
-                metrics.stoppingMethod(), metrics.usesSneak(), metrics.terminationReason());
+                metrics.stoppingMethod(), metrics.usesSneak(), activePlan.routeMode(),
+                activePlan.contactEvents().size(), activePlan.commandLatencyTicks(),
+                activePlan.validatedToleranceVariants(), activePlan.launchEnvelope().maximumPositionError(),
+                activePlan.launchEnvelope().maximumVelocityError(), activePlan.launchEnvelope().yawTolerance(),
+                metrics.terminationReason());
         if (client != null) ChatMessageUtil.sendSuccess(client, String.format(
-                "Route ready: %.2f block lead-up, %d validated launch variants.",
-                metrics.runUpLength(), metrics.robustnessScore()));
+                "Route ready: %.2f block lead-up, %d validated launch variants%s.",
+                metrics.runUpLength(), metrics.robustnessScore(),
+                activePlan.launchEnvelope().maximumPositionError() < 0.01 ? " (precision launch)" : ""));
         // Apply the first command on the same END_CLIENT_TICK that hands the plan to the
         // controller. An extra idle game tick would invalidate a velocity-bearing launch.
         tickExecution(client);
@@ -164,6 +178,12 @@ public final class StepExecutor {
             return;
         }
         if (result == StepTickResult.REPLAN) {
+            if (!isSafelySupportedForReplan(client)) {
+                finish(ExecutionState.FAILED,
+                        "Automatic replan refused because the player is no longer supported "
+                                + "by the original approach platform.", client);
+                return;
+            }
             if (replanAttempts++ >= 1) {
                 finish(ExecutionState.FAILED,
                         "Launch alignment missed twice; execution stopped cleanly.", client);
@@ -183,6 +203,16 @@ public final class StepExecutor {
                 "Jump completed with a stable landing.", client);
         else if (executionTicks >= MAX_EXECUTION_TICKS) finish(ExecutionState.FAILED,
                 "Trajectory execution timed out.", client);
+    }
+
+    private boolean isSafelySupportedForReplan(MinecraftClient client) {
+        if (client == null || client.player == null || activePlan == null || planningWorld == null) {
+            return false;
+        }
+        PlayerSnapshot observed = PlayerSnapshot.capture(client.player);
+        return SupportResolver.resolve(observed.boundingBox(), observed.feetPosition(),
+                observed.onGround(), activePlan.landingRegion(),
+                activePlan.approachPlan().supportRegion(), planningWorld).kind() == SupportKind.TAKEOFF;
     }
 
     boolean startPlan(MovementPlan plan, WorldView world, MinecraftClient client) {
@@ -215,6 +245,7 @@ public final class StepExecutor {
     public void stopExecution() { cancel(MinecraftClient.getInstance(), "Jump execution stopped."); }
 
     private void finish(ExecutionState terminalState, String terminalReason, MinecraftClient client) {
+        if (planningSession != null) planningSession.cancel();
         try { controller.stop(client); }
         catch (RuntimeException exception) { LOGGER.error("Movement cleanup failed", exception); }
         state = terminalState;

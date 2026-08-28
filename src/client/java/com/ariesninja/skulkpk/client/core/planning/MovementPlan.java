@@ -23,7 +23,13 @@ public record MovementPlan(
         LandingZone landingZone,
         LaunchLane launchLane,
         Vec3d settleAnchor,
-        PlanningStage planningStage
+        PlanningStage planningStage,
+        ApproachPlan approachPlan,
+        List<ContactEvent> contactEvents,
+        RouteMode routeMode,
+        int commandLatencyTicks,
+        List<ConfigurationObstacle> configurationObstacles,
+        int validatedToleranceVariants
 ) {
     public MovementPlan {
         positioningPath = List.copyOf(positioningPath);
@@ -38,6 +44,13 @@ public record MovementPlan(
         landingZone = Objects.requireNonNull(landingZone);
         settleAnchor = Objects.requireNonNull(settleAnchor);
         planningStage = Objects.requireNonNull(planningStage);
+        approachPlan = Objects.requireNonNull(approachPlan);
+        contactEvents = List.copyOf(contactEvents);
+        routeMode = Objects.requireNonNull(routeMode);
+        configurationObstacles = List.copyOf(configurationObstacles);
+        if (commandLatencyTicks < 0 || validatedToleranceVariants < 0) {
+            throw new IllegalArgumentException("Latency and validation counts cannot be negative.");
+        }
         if (controlFrames.isEmpty() || predictedTrajectory.isEmpty() || landingRegion.isEmpty()) {
             throw new IllegalArgumentException("A movement plan needs controls, predictions, and a landing region.");
         }
@@ -55,7 +68,8 @@ public record MovementPlan(
                         stagingPosition.z + 0.08), Vec3d.ZERO, 0.25, 0.12, 0, 2),
                 metrics, worldFingerprint, fingerprintRegion,
                 LandingZone.build(landingRegion, snapshotFor(stagingPosition)), null,
-                predictedTrajectory.getLast().feetPosition(), PlanningStage.DIRECT);
+                predictedTrajectory.getLast().feetPosition(), PlanningStage.DIRECT,
+                defaultApproach(stagingPosition), List.of(), RouteMode.DIRECT, 1, List.of(), 0);
     }
 
     public MovementPlan(List<Vec3d> positioningPath, List<ControlFrame> controlFrames,
@@ -66,7 +80,14 @@ public record MovementPlan(
         this(positioningPath, controlFrames, predictedTrajectory, landingRegion, stagingPosition,
                 takeoffPosition, immediateLaunch, false, launchEnvelope, metrics, worldFingerprint,
                 fingerprintRegion, LandingZone.build(landingRegion, snapshotFor(stagingPosition)),
-                null, predictedTrajectory.getLast().feetPosition(), PlanningStage.DIRECT);
+                null, predictedTrajectory.getLast().feetPosition(), PlanningStage.DIRECT,
+                defaultApproach(stagingPosition), List.of(), RouteMode.DIRECT, 1, List.of(), 0);
+    }
+
+    private static ApproachPlan defaultApproach(Vec3d staging) {
+        Box region = new Box(staging.x - 0.08, staging.y - 0.06, staging.z - 0.08,
+                staging.x + 0.08, staging.y + 0.12, staging.z + 0.08);
+        return new ApproachPlan(region, List.of(), List.of(), region, 0, 0);
     }
 
     private static com.ariesninja.skulkpk.client.core.analysis.PlayerSnapshot snapshotFor(Vec3d feet) {

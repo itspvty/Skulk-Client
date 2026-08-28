@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "skulkpk-trials",
+  "version": "1.0.0",
+  "name": "Skulk development trials",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["com.ariesninja.skulkpk.trials.LiveTrialClient"],
+    "fabric-client-gametest": ["com.ariesninja.skulkpk.trials.ParkourGameTest"]
+  },
+  "mixins": ["skulkpk-trials.mixins.json"],
+  "depends": {"skulkpk": "*", "fabricloader": ">=0.16.14", "minecraft": "1.21.4"}
+}

@@ -26,6 +26,11 @@ public final class JumpAnalyzer {
 
         List<StandableSurface> landingRegion = connectedSameHeightRegion(world, selectedLanding, 12, 256);
         List<StandableSurface> walkingRegion = reachableWalkingRegion(world, standing, player.stepHeight(), 10, 256);
+        // A ladder is an intermediate attachment goal. Applying a ballistic endpoint
+        // distance bound to the final platform excludes valid catch-and-climb routes.
+        Box assistBounds = regionBounds(player.boundingBox(), List.of(standing), landingRegion).expand(2, 3, 2);
+        boolean ladderAssist = !com.ariesninja.skulkpk.client.core.planning.LadderColumn
+                .discover(world, assistBounds).isEmpty();
         if (walkingRegion.stream().anyMatch(surface -> sameSurface(surface, selectedLanding))) {
             return rejected(JumpRejectionReason.NO_JUMP_REQUIRED,
                     "The selected target is reachable without a jump.");
@@ -36,7 +41,7 @@ public final class JumpAnalyzer {
                 // floor below the player is collision context, not another runway root.
                 .filter(surface -> Math.abs(surface.topY() - standing.topY()) <= 0.01)
                 .filter(surface -> landingRegion.stream().anyMatch(landing ->
-                        landing.topY() < surface.topY() - 0.01
+                        ladderAssist || landing.topY() < surface.topY() - 0.01
                                 || edgeDistance(surface.footprint(), landing.footprint())
                                 <= MAX_LEVEL_OR_UPWARD_EDGE_DISTANCE))
                 .sorted(Comparator.comparingDouble(surface -> landingRegion.stream()
@@ -87,7 +92,9 @@ public final class JumpAnalyzer {
             for (StandableSurface surface : world.standableSurfaces(feet.add(dx, dy, dz))) {
                 double horizontal = distanceToFootprint(player.feetPosition(), surface.footprint());
                 double delta = Math.abs(player.feetPosition().y - surface.topY()) + horizontal * 2;
-                if (horizontal <= 0.35 && delta < bestDelta) { best = surface; bestDelta = delta; }
+                if (Math.abs(player.feetPosition().y - surface.topY()) <= 0.02
+                        && SupportGeometry.overlap(player.boundingBox(), surface) > 1.0E-6
+                        && delta < bestDelta) { best = surface; bestDelta = delta; }
             }
         }
         return best;
@@ -145,7 +152,7 @@ public final class JumpAnalyzer {
                     for (StandableSurface next : world.standableSurfaces(pos)) {
                         double rise = next.topY() - current.topY();
                         if (rise <= stepHeight + 0.01 && rise >= -3.01
-                                && playerClearance(world, next.centerFeet())) queue.add(next);
+                                && footprintsTouch(current.footprint(), next.footprint())) queue.add(next);
                     }
                 }
             }
@@ -153,15 +160,11 @@ public final class JumpAnalyzer {
         return List.copyOf(found);
     }
 
-    private boolean playerClearance(WorldView world, Vec3d feet) {
-        return !world.hasCollision(new Box(feet.x - 0.3, feet.y + 0.01, feet.z - 0.3,
-                feet.x + 0.3, feet.y + 1.8, feet.z + 0.3));
-    }
     private boolean sameSurface(StandableSurface a, StandableSurface b) {
-        return a.block().equals(b.block()) && Math.abs(a.topY() - b.topY()) <= 0.01;
+        return a.block().equals(b.block()) && a.footprint().equals(b.footprint());
     }
     private String surfaceKey(StandableSurface surface) {
-        return surface.block().asLong() + ":" + Math.round(surface.topY() * 1000);
+        return surface.block().asLong() + ":" + surface.footprint();
     }
     private boolean footprintsTouch(Box a, Box b) {
         return a.maxX >= b.minX - 0.01 && b.maxX >= a.minX - 0.01

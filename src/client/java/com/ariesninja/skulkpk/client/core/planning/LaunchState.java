@@ -15,7 +15,18 @@ public record LaunchState(
         double runUpLength,
         int jumpTick,
         List<ControlInput> groundPrefix,
-        boolean startsFromCurrentState
+        boolean startsFromCurrentState,
+        RouteMode approachMode
 ) {
-    public LaunchState { groundPrefix = List.copyOf(groundPrefix); }
+    public LaunchState {
+        groundPrefix = List.copyOf(groundPrefix);
+        if (approachMode == null) approachMode = RouteMode.DIRECT;
+    }
+
+    public LaunchState(ParkourState initialState, ParkourState state, LaunchLane lane,
+                       Vec3d stagingPosition, double runUpLength, int jumpTick,
+                       List<ControlInput> groundPrefix, boolean startsFromCurrentState) {
+        this(initialState, state, lane, stagingPosition, runUpLength, jumpTick,
+                groundPrefix, startsFromCurrentState, RouteMode.DIRECT);
+    }
 }

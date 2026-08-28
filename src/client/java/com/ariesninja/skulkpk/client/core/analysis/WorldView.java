@@ -9,6 +9,16 @@ import java.util.ArrayList;
 import java.util.List;
 
 public interface WorldView extends PhysicsWorld {
+    record Cell(List<Box> collisions, boolean solid, boolean air, boolean ladder,
+                boolean climbable, boolean fluid, double slipperiness, double jumpMultiplier) {
+        public Cell { collisions = List.copyOf(collisions); }
+    }
+
+    /** Captured on the client thread; contains no live world/block-state references. */
+    default Cell captureCell(BlockPos pos) {
+        return new Cell(collisionBoxes(new Box(pos)), isSolid(pos), isAir(pos), isLadder(pos),
+                isClimbable(pos), hasFluid(pos), slipperiness(pos), jumpMultiplier(pos));
+    }
     boolean isSolid(BlockPos pos);
     boolean isAir(BlockPos pos);
     boolean isLadder(BlockPos pos);
@@ -34,11 +44,7 @@ public interface WorldView extends PhysicsWorld {
     }
 
     default List<StandableSurface> standableSurfaces(BlockPos pos) {
-        if (!isSolid(pos)) return List.of();
-        Box top = new Box(pos.getX(), pos.getY(), pos.getZ(), pos.getX() + 1, pos.getY() + 1, pos.getZ() + 1);
-        Box player = new Box(pos.getX() + 0.2, pos.getY() + 1, pos.getZ() + 0.2,
-                pos.getX() + 0.8, pos.getY() + 2.8, pos.getZ() + 0.8);
-        return hasCollision(player) ? List.of() : List.of(new StandableSurface(pos, top, pos.getY() + 1));
+        return SupportGeometry.surfaces(this, pos, captureCell(pos).collisions());
     }
 
     default double slipperiness(BlockPos pos) { return 0.6; }

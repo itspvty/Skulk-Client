@@ -10,6 +10,9 @@ import java.util.List;
 public final class InMemoryPhysicsWorld implements WorldView {
     private final List<Box> boxes = new ArrayList<>();
     private long fingerprint = 11;
+    private final java.util.Set<BlockPos> ladders = new java.util.HashSet<>();
+
+    public InMemoryPhysicsWorld ladder(BlockPos pos) { ladders.add(pos.toImmutable()); return this; }
 
     public InMemoryPhysicsWorld floor(int x, int z, double topY) {
         boxes.add(new Box(x, topY - 1, z, x + 1, topY, z + 1));
@@ -27,7 +30,7 @@ public final class InMemoryPhysicsWorld implements WorldView {
         return boxes.stream().anyMatch(box -> box.equals(block));
     }
     @Override public boolean isAir(BlockPos pos) { return !isSolid(pos); }
-    @Override public boolean isLadder(BlockPos pos) { return false; }
+    @Override public boolean isLadder(BlockPos pos) { return ladders.contains(pos); }
     @Override public boolean hasCollision(Box box) { return !collisionBoxes(box).isEmpty(); }
     @Override public int topY() { return 320; }
     @Override public long fingerprint(Box region) { return fingerprint; }

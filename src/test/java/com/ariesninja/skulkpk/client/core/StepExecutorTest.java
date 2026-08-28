@@ -41,6 +41,19 @@ class StepExecutorTest {
         assertEquals(1, controller.stops);
     }
 
+    @Test void executorRefusesAReplanWithoutObservedOriginalApproachSupport() {
+        FakeController controller = new FakeController(StepTickResult.REPLAN);
+        controller.reason = "restage";
+        StepExecutor executor = new StepExecutor(controller);
+        executor.startPlan(plan(1), world(7), null);
+
+        executor.tick(null);
+
+        assertEquals(ExecutionState.FAILED, executor.getStatus().state());
+        assertTrue(executor.getStatus().reason().contains("original approach platform"));
+        assertEquals(1, controller.stops);
+    }
+
     @Test void executionTimesOutAndCleansUp() {
         FakeController controller = new FakeController();
         StepExecutor executor = new StepExecutor(controller);

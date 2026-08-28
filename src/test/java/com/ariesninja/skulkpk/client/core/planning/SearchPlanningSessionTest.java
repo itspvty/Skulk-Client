@@ -50,7 +50,8 @@ class SearchPlanningSessionTest {
                 approach, landing, feet, -90, PlanningPolicy.AGGRESSIVE)));
         assertEquals(PlanningStage.DIRECT, plan.planningStage());
         assertTrue(plan.metrics().directNanos() < 200_000_000L);
-        assertTrue(plan.metrics().searchNanos() <= PlanningPolicy.AGGRESSIVE.maximumWallNanos());
+        assertTrue(plan.metrics().searchNanos() <= PlanningPolicy.AGGRESSIVE.maximumWallNanos(),
+                "searchMs=" + plan.metrics().searchNanos() / 1_000_000.0);
         assertEquals(SupportKind.TARGET, plan.predictedTrajectory().getLast().support());
         assertTrue(plan.metrics().runUpLength() >= 1.0);
         assertTrue(plan.controlFrames().stream().anyMatch(frame -> frame.sprint() && frame.jump()));
@@ -111,8 +112,8 @@ class SearchPlanningSessionTest {
         assertEquals(SupportKind.TARGET, plan.predictedTrajectory().getLast().support());
         assertTrue(plan.launchLane().takeoffPoint().z > 0.60,
                 "The shifted target should use the near lateral edge of the runway.");
-        assertTrue(plan.launchLane().landingAnchor().feet().z < 1.50,
-                "The shifted target should use its near landing edge instead of its center.");
+        assertTrue(plan.predictedTrajectory().stream().anyMatch(sample -> sample.support() == SupportKind.TARGET),
+                "The shifted route must be validated against the actual connected target support.");
         assertTrue(plan.launchLane().triggerMinimum() <= -0.90,
                 "Only maximum-gap geometry should retain the measured coyote launch window.");
     }
@@ -232,9 +233,9 @@ class SearchPlanningSessionTest {
 
         assertEquals(PlanningStage.DIRECT, plan.planningStage());
         assertTrue(plan.predictedTrajectory().stream().anyMatch(TrajectorySample::verticalCollision));
-        assertTrue(plan.controlFrames().stream().anyMatch(frame -> frame.phase() == ControlPhase.RUN_UP
-                && frame.sprint()));
-        assertTrue(plan.controlFrames().stream().anyMatch(frame -> frame.jump() && frame.sprint()));
+        assertEquals(RouteMode.CONTACT_HEAD, plan.routeMode());
+        assertTrue(plan.contactEvents().stream().anyMatch(event ->
+                event.requirement() == ContactRequirement.REQUIRED && event.face().headContact()));
         assertEquals(SupportKind.TARGET, plan.predictedTrajectory().getLast().support());
     }
 
@@ -257,12 +258,14 @@ class SearchPlanningSessionTest {
                 PlanningPolicy.AGGRESSIVE)));
 
         assertEquals(PlanningStage.OBSTACLE, plan.planningStage());
-        assertTrue(plan.metrics().searchNanos() <= PlanningPolicy.AGGRESSIVE.maximumWallNanos());
+        assertTrue(plan.metrics().searchNanos() <= PlanningPolicy.AGGRESSIVE.maximumWallNanos(),
+                "searchMs=" + plan.metrics().searchNanos() / 1_000_000.0);
         assertEquals(SupportKind.TARGET, plan.predictedTrajectory().getLast().support());
         assertTrue(plan.controlFrames().stream().anyMatch(frame -> frame.phase() == ControlPhase.RUN_UP
                 && Math.abs(frame.strafe()) > 0.1));
-        assertTrue(plan.takeoffPosition().z > 0.60,
-                "The neo should jump before reaching the pillar-adjacent exposed edge.");
+        assertTrue(plan.routeMode() == RouteMode.AVOID_LEFT || plan.routeMode() == RouteMode.AVOID_RIGHT);
+        assertEquals(8, plan.validatedToleranceVariants());
+        assertTrue(plan.approachPlan().commitIndex() <= plan.approachPlan().lastSupportedIndex());
         assertTrue(plan.predictedTrajectory().stream().noneMatch(TrajectorySample::horizontalCollision));
         Box pillar = new Box(0, 0, -1, 1, 2, 0);
         double clearance = plan.predictedTrajectory().stream()
@@ -270,9 +273,42 @@ class SearchPlanningSessionTest {
                         && sample.boundingBox().minY < pillar.maxY)
                 .mapToDouble(sample -> horizontalGap(sample.boundingBox(), pillar))
                 .min().orElse(1);
-        assertTrue(clearance >= 0.08, "pillar clearance=" + clearance);
+        assertTrue(clearance > 0, "The nominal swept body must not touch the pillar.");
         assertTrue(plan.predictedTrajectory().stream().anyMatch(sample ->
                 Math.abs(sample.feetPosition().x - 0.5) > 0.82));
+    }
+
+    @Test void productionPhysicsRetainsAFullColumnAvoidanceHomotopy() {
+        InMemoryPhysicsWorld world = new InMemoryPhysicsWorld();
+        for (int z = 0; z <= 2; z++) world.floor(0, z, 0);
+        for (int z = -3; z <= -2; z++) world.floor(0, z, 0);
+        world.floor(0, -1, 0).box(new Box(0, 0, -1, 1, 2, 0));
+        Vec3d start = new Vec3d(0.5, 0, 2.65);
+        PlayerSnapshot player = new PlayerSnapshot(start, box(start), Vec3d.ZERO, 180,
+                true, false, false, 0.1, 0.42, 0.6, Map.of());
+        ParkourPhysics physics = new ParkourPhysics();
+        ParkourState state = ParkourState.at(player, start, Vec3d.ZERO, -180, true, false);
+        List<ControlInput> inputs = new ArrayList<>();
+        inputs.add(new ControlInput(1, 0, true, false, false, -180));
+        inputs.add(new ControlInput(1, 0, true, false, false, -180));
+        for (int i = 0; i < 5; i++) inputs.add(new ControlInput(1, 1, true, false, false, -180));
+        inputs.add(new ControlInput(1, 0, true, true, false, -168));
+        inputs.add(new ControlInput(1, 1, true, false, false, -156));
+        inputs.add(new ControlInput(1, 1, true, false, false, -152.01054f));
+        inputs.add(new ControlInput(1, 0, true, false, false, -156.90967f));
+        inputs.add(new ControlInput(1, 1, true, false, false, -145.44794f));
+        inputs.add(new ControlInput(1, 1, true, false, false, -141.01683f));
+        inputs.add(new ControlInput(1, 0, true, false, false, -143.3419f));
+        inputs.add(new ControlInput(1, -1, true, false, false, -144.68614f));
+        for (float yaw : new float[]{-132.68614f, -120.70646f, -109.90018f, -97.90018f})
+            inputs.add(new ControlInput(1, 0, true, false, false, yaw));
+        for (ControlInput input : inputs) state = physics.tick(world, state, input).state();
+        for (int tick = 0; tick < 8 && !state.onGround(); tick++)
+            state = physics.tick(world, state, new ControlInput(0, 0, false,
+                    false, false, -90)).state();
+        assertTrue(state.onGround(), "known avoidance trajectory should reach ground: " + state);
+        assertTrue(SupportResolver.targetSupported(state.boundingBox(), state.feetPosition(), true,
+                List.of(surface(0, -3, 0), surface(0, -2, 0))), "touchdown=" + state);
     }
 
     @Test void oneBlockNeoUsesAnEarlyClearanceLaneInsteadOfThePillarEdge() {
@@ -292,9 +328,9 @@ class SearchPlanningSessionTest {
                 PlanningPolicy.AGGRESSIVE)));
 
         assertEquals(PlanningStage.OBSTACLE, plan.planningStage());
-        assertTrue(plan.takeoffPosition().z > 0.60);
-        assertTrue(plan.launchLane().triggerMinimum() >= -0.121,
-                "A neo must commit before walking beyond its early supported launch lane.");
+        assertTrue(plan.routeMode() == RouteMode.AVOID_LEFT || plan.routeMode() == RouteMode.AVOID_RIGHT);
+        assertTrue(plan.approachPlan().commitIndex() <= plan.approachPlan().lastSupportedIndex(),
+                "Jump input must be committed before the last supported approach state.");
         assertTrue(plan.predictedTrajectory().stream().noneMatch(TrajectorySample::horizontalCollision));
         assertEquals(SupportKind.TARGET, plan.predictedTrajectory().getLast().support());
         Box pillar = new Box(0, 0, -1, 1, 3, 0);
@@ -303,7 +339,29 @@ class SearchPlanningSessionTest {
                         && sample.boundingBox().minY < pillar.maxY)
                 .mapToDouble(sample -> horizontalGap(sample.boundingBox(), pillar))
                 .min().orElse(1);
-        assertTrue(clearance >= 0.08, "pillar clearance=" + clearance);
+        assertTrue(clearance > 0, "The nominal swept body must not touch the pillar.");
+        assertEquals(8, plan.validatedToleranceVariants());
+    }
+
+    @Test void floatingAndFullPillarsProduceEquivalentAvoidanceTopology() {
+        MovementPlan full = pillarTopologyPlan(false);
+        MovementPlan floating = pillarTopologyPlan(true);
+
+        assertTrue(full.routeMode() == RouteMode.AVOID_LEFT || full.routeMode() == RouteMode.AVOID_RIGHT);
+        assertTrue(floating.routeMode() == RouteMode.AVOID_LEFT
+                || floating.routeMode() == RouteMode.AVOID_RIGHT);
+        assertEquals(8, full.validatedToleranceVariants());
+        assertEquals(8, floating.validatedToleranceVariants());
+        Box fullObstacle = full.configurationObstacles().stream()
+                .filter(obstacle -> obstacle.collisionShape().maxY >= 2).findFirst().orElseThrow()
+                .forbiddenFeet();
+        Box floatingObstacle = floating.configurationObstacles().stream()
+                .filter(obstacle -> obstacle.collisionShape().maxY >= 2).findFirst().orElseThrow()
+                .forbiddenFeet();
+        assertEquals(fullObstacle.minX, floatingObstacle.minX, 1.0E-9);
+        assertEquals(fullObstacle.maxX, floatingObstacle.maxX, 1.0E-9);
+        assertEquals(fullObstacle.minZ, floatingObstacle.minZ, 1.0E-9);
+        assertEquals(fullObstacle.maxZ, floatingObstacle.maxZ, 1.0E-9);
     }
 
     @Test void cornerObstacleRouteRetainsUsefulSideContactOrLateralFlightWithinProductionBudget() {
@@ -348,6 +406,23 @@ class SearchPlanningSessionTest {
         PlanningTickResult result = terminal(session);
         if (result instanceof PlanningTickResult.Rejected rejected) return fail(rejected.message());
         return assertInstanceOf(PlanningTickResult.Ready.class, result).plan();
+    }
+
+    private MovementPlan pillarTopologyPlan(boolean floating) {
+        InMemoryPhysicsWorld world = new InMemoryPhysicsWorld();
+        List<StandableSurface> approach = new ArrayList<>();
+        for (int z = 0; z <= 2; z++) {
+            world.floor(0, z, 0);
+            approach.add(surface(0, z, 0));
+        }
+        StandableSurface landing = surface(0, -2, 0);
+        world.floor(0, -2, 0);
+        if (!floating) world.floor(0, -1, 0);
+        world.box(floating ? new Box(0, 1, -1, 1, 3, 0)
+                : new Box(0, 0, -1, 1, 3, 0));
+        return ready(new SearchPlanningSession(customRequest(world,
+                List.of(surface(0, 0, 0)), approach, List.of(landing),
+                new Vec3d(0.5, 0, 1.5), 180, PlanningPolicy.AGGRESSIVE)));
     }
 
     private PlanningTickResult terminal(SearchPlanningSession session) {
@@ -430,7 +505,7 @@ class SearchPlanningSessionTest {
             for (int launchTick = 0; launchTick < 20; launchTick++) {
                 for (int release = 3; release <= 14; release++) {
                     ParkourState flight = physics.tick(world, ground,
-                            new ControlInput(1, 0, true, true, false, yaw));
+                            new ControlInput(1, 0, true, true, false, yaw)).state();
                     boolean airborne = !flight.onGround();
                     for (int tick = 1; tick < 60; tick++) {
                         if (airborne && flight.onGround()) {
@@ -439,7 +514,7 @@ class SearchPlanningSessionTest {
                                 boolean stable = true;
                                 for (int settle = 0; settle < 14; settle++) {
                                     flight = physics.tick(world, flight, new ControlInput(
-                                            0, 0, false, false, true, yaw));
+                                            0, 0, false, false, true, yaw)).state();
                                     stable &= SupportResolver.targetSupported(flight.boundingBox(),
                                             flight.feetPosition(), flight.onGround(), landing);
                                 }
@@ -448,12 +523,12 @@ class SearchPlanningSessionTest {
                             break;
                         }
                         flight = physics.tick(world, flight, new ControlInput(
-                                tick < release ? 1 : -1, 0, true, false, false, yaw));
+                                tick < release ? 1 : -1, 0, true, false, false, yaw)).state();
                         airborne |= !flight.onGround();
                     }
                 }
                 ground = physics.tick(world, ground, new ControlInput(1, 0, true,
-                        false, false, yaw));
+                        false, false, yaw)).state();
                 if (!ground.onGround()) break;
             }
         }

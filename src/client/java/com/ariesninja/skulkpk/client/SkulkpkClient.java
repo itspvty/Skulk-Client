@@ -20,6 +20,7 @@ public class SkulkpkClient implements ClientModInitializer {
     @Override
     public void onInitializeClient() {
         Keybinds.register();
+        SkulkCommands.register();
         SelectionRenderer.register();
         ClientTickEvents.END_CLIENT_TICK.register(this::onClientTick);
 

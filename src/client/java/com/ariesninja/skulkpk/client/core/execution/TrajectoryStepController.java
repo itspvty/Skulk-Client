@@ -1,654 +1,924 @@
 package com.ariesninja.skulkpk.client.core.execution;
 
-import com.ariesninja.skulkpk.client.core.analysis.PlayerSnapshot;
 import com.ariesninja.skulkpk.client.core.analysis.WorldView;
+import com.ariesninja.skulkpk.client.core.physics.CollisionContact;
 import com.ariesninja.skulkpk.client.core.physics.ControlInput;
 import com.ariesninja.skulkpk.client.core.physics.ParkourPhysics;
 import com.ariesninja.skulkpk.client.core.physics.ParkourState;
+import com.ariesninja.skulkpk.client.core.physics.PhysicsStep;
+import com.ariesninja.skulkpk.client.core.planning.ContactEvent;
+import com.ariesninja.skulkpk.client.core.planning.ContactRequirement;
 import com.ariesninja.skulkpk.client.core.planning.ControlFrame;
 import com.ariesninja.skulkpk.client.core.planning.ControlPhase;
 import com.ariesninja.skulkpk.client.core.planning.FrameGuard;
 import com.ariesninja.skulkpk.client.core.planning.LandingStabilityTracker;
+import com.ariesninja.skulkpk.client.core.planning.LadderColumn;
+import com.ariesninja.skulkpk.client.core.planning.LadderContinuation;
+import com.ariesninja.skulkpk.client.core.planning.LaunchEnvelope;
 import com.ariesninja.skulkpk.client.core.planning.MovementPlan;
+import com.ariesninja.skulkpk.client.core.planning.RouteMode;
+import com.ariesninja.skulkpk.client.core.planning.SupportKind;
 import com.ariesninja.skulkpk.client.core.planning.SupportResolver;
 import com.ariesninja.skulkpk.client.core.planning.TrajectorySample;
 import net.minecraft.client.MinecraftClient;
-import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.util.math.Box;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 
-import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
-/** Executes predicted controls against observed phases instead of elapsed client ticks. */
+/** Executes one acknowledged command transition at a time against the planned state tube. */
 public final class TrajectoryStepController implements StepController {
     private static final double AIRBORNE_POSITION_DEADBAND = 0.18;
     private static final double AIRBORNE_VELOCITY_DEADBAND = 0.10;
     private static final double AIRBORNE_VERTICAL_POSITION_DEADBAND = 0.16;
     private static final double AIRBORNE_VERTICAL_VELOCITY_DEADBAND = 0.10;
-    private static final int RECOVERY_HORIZON_TICKS = 120;
+    private static final double PRECOMMIT_POSITION_LIMIT = 0.25;
+    private static final double PRECOMMIT_VELOCITY_LIMIT = 0.12;
     private static final float MAX_YAW_CHANGE = 12;
-    private static final int MAX_SNEAK_TICKS = 6;
-    private static final int MAX_ALIGNMENT_TICKS = 30;
-    private static final int MAX_TAKEOFF_LOOKAHEAD_TICKS = 8;
-    private static final double OBSTACLE_RECOVERY_CLEARANCE = 0.18;
+    private static final int MAX_STAGING_TICKS = 40;
+    private static final int STALL_TICKS = 6;
+    private static final int STAGING_OBSERVATIONS = 2;
+    private static final int TAKEOFF_LATCH_EPOCHS = 2;
+    private static final int MPC_HORIZON = 4;
 
-    private final ParkourPhysics physics = new ParkourPhysics();
+    enum ControllerPhase { STAGING, APPROACH_TRACKING, TAKEOFF_COMMITTED, CONTACT_TRANSIT, LANDING }
+    enum TakeoffDecision { JUMP_NOW, APPROACH, ABORT }
 
+    private final ParkourPhysics physics;
+    private final MovementIO movementIO;
     private MovementPlan plan;
     private WorldView world;
     private LandingStabilityTracker landingTracker;
-    private int waypointIndex;
-    private int frameIndex;
-    private int outsideGroundTicks;
-    private int consecutiveSneakTicks;
-    private int jumpWaitTicks;
-    private int alignmentTicks;
-    private int airborneMismatchTicks;
-    private boolean launched;
-    private boolean jumpCommanded;
-    private ControlFrame pendingTakeoffFrame;
-    private double takeoffCommandFeetY;
-    private boolean launchStaged;
-    private boolean launchAligned;
-    private boolean runUpStarted;
-    private double previousTargetDistance = Double.MAX_VALUE;
+    private ControllerPhase phase;
+    private PendingCommand pending;
+    private LaunchEnvelope launchEnvelope;
+    private List<TrajectorySample> referenceTrajectory;
+    private List<LadderColumn> ladderColumns = List.of();
+    private String stagingDiagnostic = "No nearby candidate tested.";
+    private int controlIndex;
+    private int jumpIndex;
+    private int stagingTicks;
+    private int stagingObservations;
+    private int stalledTicks;
+    private int takeoffLatchEpochs;
+    private int airborneExtraTicks;
+    private int ladderRecoveryTicks;
+    private boolean approachValidated;
+    private double bestStagingScore;
+    private double takeoffFeetY;
+    private ControlFrame takeoffFrame;
+    private final Set<String> satisfiedContacts = new LinkedHashSet<>();
     private String reason = "";
+
+    public TrajectoryStepController() { this(new MinecraftMovementIO(), new ParkourPhysics()); }
+    public TrajectoryStepController(MovementIO movementIO) {
+        this(movementIO, new ParkourPhysics());
+    }
+    TrajectoryStepController(MovementIO movementIO, ParkourPhysics physics) {
+        this.movementIO = java.util.Objects.requireNonNull(movementIO);
+        this.physics = java.util.Objects.requireNonNull(physics);
+    }
 
     @Override
     public void start(MovementPlan plan, WorldView world) {
-        this.plan = plan;
-        this.world = world;
+        this.plan = java.util.Objects.requireNonNull(plan);
+        launchEnvelope = plan.launchEnvelope();
+        referenceTrajectory = plan.predictedTrajectory();
+        stagingDiagnostic = "No nearby candidate tested.";
+        this.world = java.util.Objects.requireNonNull(world);
+        ladderColumns = plan.routeMode() == RouteMode.LADDER_ASSIST
+                ? LadderColumn.discover(world, plan.fingerprintRegion().contract(0.01)) : List.of();
         landingTracker = new LandingStabilityTracker(plan.landingRegion());
-        waypointIndex = 0;
-        frameIndex = 0;
-        outsideGroundTicks = 0;
-        consecutiveSneakTicks = 0;
-        jumpWaitTicks = 0;
-        alignmentTicks = 0;
-        airborneMismatchTicks = 0;
-        launched = false;
-        jumpCommanded = false;
-        pendingTakeoffFrame = null;
-        takeoffCommandFeetY = 0;
-        runUpStarted = false;
-        // A validated current-state launch must apply its first input on the handoff tick.
-        // Spending even one idle tick here changes velocity and invalidates the simulation.
-        launchStaged = plan.immediateLaunch();
-        launchAligned = plan.immediateLaunch();
-        previousTargetDistance = Double.MAX_VALUE;
+        jumpIndex = 0;
+        while (jumpIndex < plan.controlFrames().size()
+                && !plan.controlFrames().get(jumpIndex).jump()) jumpIndex++;
+        controlIndex = 0;
+        phase = plan.immediateLaunch() ? ControllerPhase.APPROACH_TRACKING : ControllerPhase.STAGING;
+        pending = null;
+        stagingTicks = 0;
+        stagingObservations = 0;
+        stalledTicks = 0;
+        takeoffLatchEpochs = 0;
+        airborneExtraTicks = 0;
+        ladderRecoveryTicks = 0;
+        approachValidated = false;
+        bestStagingScore = Double.MAX_VALUE;
+        takeoffFeetY = 0;
+        takeoffFrame = null;
+        satisfiedContacts.clear();
         reason = "";
     }
 
     @Override
     public StepTickResult tick(MinecraftClient client) {
-        if (plan == null || client.player == null) return fail("The player or active plan is unavailable.");
-        if (client.world == null || world.identityToken() != client.world) {
+        if (plan == null || world == null) return fail("The active movement plan is unavailable.");
+        if (client != null && (client.world == null || world.identityToken() != client.world)) {
             return fail("The active world changed after planning.");
         }
         if (world.fingerprint(plan.fingerprintRegion()) != plan.worldFingerprint()) {
             return fail("World geometry changed after planning.");
         }
 
-        PlayerEntity player = client.player;
-        if (jumpCommanded && !launched) {
-            StepTickResult pending = acknowledgeTakeoff(client, player);
-            if (pending != null) return pending;
+        MovementObservation observation;
+        try { observation = movementIO.observe(client); }
+        catch (RuntimeException exception) { return fail("The observed player state is unavailable."); }
+        ParkourState state = observation.state();
+        boolean targetSupported = targetSupported(state);
+        if (pending != null) {
+            if (observation.observedCommandEpoch() < pending.epoch) return StepTickResult.RUNNING;
+            StepTickResult acknowledged = acknowledge(state, targetSupported, client);
+            if (acknowledged != null) return acknowledged;
         }
-        boolean targetSupported = targetSupported(player);
-        if (!targetSupported) client.options.sneakKey.setPressed(false);
+        if (targetSupported(state) && state.onGround()) phase = ControllerPhase.LANDING;
+        return switch (phase) {
+            case STAGING -> tickStaging(state, client);
+            case APPROACH_TRACKING -> tickApproach(state, client);
+            case TAKEOFF_COMMITTED -> tickCommitted(state, client);
+            case CONTACT_TRANSIT -> tickAirborne(state, client);
+            case LANDING -> tickLanding(state, client);
+        };
+    }
 
-        if (launched && targetSupported) return tickLanding(client, player);
-        if (launched && player.isOnGround()) {
-            double distance = SupportResolver.distanceToRegion(player.getPos(), plan.landingRegion());
-            boolean approaching = distance < previousTargetDistance - 0.005;
-            previousTargetDistance = distance;
-            if (++outsideGroundTicks > 2 || !approaching) {
-                return fail("Wrong support: the jump grounded outside the connected target region.");
+    private StepTickResult acknowledge(ParkourState observed, boolean targetSupported,
+                                       MinecraftClient client) {
+        PendingCommand command = pending;
+        pending = null;
+        matchContacts(command, observed);
+        if (isAvoidanceRoute() && (observed.horizontalCollision()
+                || command.expected.collisions().contacts().stream()
+                    .anyMatch(contact -> !contact.support()))) {
+            movementIO.release(client);
+            String features = command.expected.collisions().contacts().stream()
+                    .filter(contact -> !contact.support())
+                    .map(contact -> contact.featureId() + ":" + contact.face())
+                    .collect(java.util.stream.Collectors.joining(","));
+            return fail(String.format("Unplanned obstacle contact during %s at command epoch %d "
+                            + "(plan index %d, observedHorizontal=%s, expected=%s).",
+                    command.frame.phase(), command.epoch, command.planIndex,
+                    observed.horizontalCollision(), features.isEmpty() ? "none" : features));
+        }
+        if (command.jump) {
+            double displacement = observed.feetPosition().y - takeoffFeetY;
+            boolean upwardContact = observed.verticalCollision()
+                    || command.expected.collisions().hasHeadContact();
+            if (isTakeoffConfirmed(observed.onGround(), displacement,
+                    observed.velocity().y, upwardContact)) {
+                phase = ControllerPhase.CONTACT_TRANSIT;
+                controlIndex = Math.max(controlIndex, command.planIndex + 1);
+                takeoffLatchEpochs = 0;
+                return null;
             }
-        } else {
-            outsideGroundTicks = 0;
-            previousTargetDistance = SupportResolver.distanceToRegion(player.getPos(), plan.landingRegion());
-        }
-
-        if (waypointIndex < plan.positioningPath().size()) return position(client, player);
-        if (!launchStaged) return stageForLaunch(client, player);
-        if (!launchAligned) return alignForLaunch(client, player);
-        return executeTrajectory(client, player, targetSupported);
-    }
-
-    private StepTickResult position(MinecraftClient client, PlayerEntity player) {
-        Vec3d target = plan.positioningPath().get(waypointIndex);
-        boolean finalWaypoint = waypointIndex == plan.positioningPath().size() - 1;
-        boolean reached = finalWaypoint ? insideLaunchEnvelope(player)
-                : horizontalDistance(player.getPos(), target) <= 0.12
-                    && player.getVelocity().horizontalLength() <= 0.07;
-        if (reached) {
-            release(client);
-            waypointIndex++;
-            if (waypointIndex >= plan.positioningPath().size()) {
-                launchStaged = true;
-                alignmentTicks = 0;
+            if (!observed.onGround()) {
+                movementIO.release(client);
+                return fail("Missed takeoff: support was lost without a jump impulse.");
             }
-            return StepTickResult.RUNNING;
-        }
-        if (++alignmentTicks > MAX_ALIGNMENT_TICKS) return replan(
-                "The fixed launch envelope was not reached within 30 ticks.");
-        laneRelativePosition(client, player, target);
-        return StepTickResult.RUNNING;
-    }
-
-    private StepTickResult stageForLaunch(MinecraftClient client, PlayerEntity player) {
-        if (currentStateLaunchDrifted(player)) {
-            release(client);
-            return replan("The captured current-state launch changed while planning.");
-        }
-        if (insideLaunchEnvelope(player)) {
-            release(client);
-            launchStaged = true;
-            alignmentTicks = 0;
-            return StepTickResult.RUNNING;
-        }
-        if (++alignmentTicks > MAX_ALIGNMENT_TICKS) return replan(
-                "The fixed launch envelope was not reached within 30 ticks.");
-        laneRelativePosition(client, player, plan.stagingPosition());
-        return StepTickResult.RUNNING;
-    }
-
-    private void laneRelativePosition(MinecraftClient client, PlayerEntity player, Vec3d target) {
-        float desiredYaw = plan.launchEnvelope().desiredYaw();
-        float yawError = MathHelper.wrapDegrees(desiredYaw - player.getYaw());
-        if (!isLaunchYawAligned(yawError)) {
-            release(client);
-            smoothYaw(player, desiredYaw);
-            return;
-        }
-        Vec3d heading = plan.launchEnvelope().routeHeading();
-        Vec3d side = ControlInput.strafeDirection(heading);
-        Vec3d delta = target.subtract(player.getPos());
-        double longitudinal = delta.dotProduct(heading);
-        double lateral = delta.dotProduct(side);
-        float forward = Math.abs(longitudinal) <= 0.035 ? 0 : Math.signum((float) longitudinal);
-        float strafe = Math.abs(lateral) <= 0.035 ? 0 : Math.signum((float) lateral);
-        if (player.getVelocity().horizontalLength() > 0.08 && Math.hypot(longitudinal, lateral) < 0.16) {
-            Vec3d velocity = player.getVelocity();
-            forward = (float) -Math.signum(velocity.dotProduct(heading));
-            strafe = (float) -Math.signum(velocity.dotProduct(side));
-        }
-        setMovement(client, forward, strafe, false, false, false);
-    }
-
-    private StepTickResult alignForLaunch(MinecraftClient client, PlayerEntity player) {
-        float desiredYaw = plan.launchEnvelope().desiredYaw();
-        float yawError = MathHelper.wrapDegrees(desiredYaw - player.getYaw());
-        release(client);
-        if (!plan.launchEnvelope().containsPosition(player.getPos())) {
-            if (plan.currentStateLaunch()) {
-                return replan("The captured current-state launch changed during alignment.");
+            if (takeoffLatchEpochs >= TAKEOFF_LATCH_EPOCHS) {
+                movementIO.release(client);
+                return fail("The jump command was not accepted within two command epochs.");
             }
-            launchStaged = false;
-            return StepTickResult.RUNNING;
+            takeoffLatchEpochs++;
+            return issue(observed, takeoffFrame, jumpIndex, false, client);
         }
-        if (++alignmentTicks > MAX_ALIGNMENT_TICKS) return replan(
-                "Launch alignment exceeded 30 ticks.");
-        if (Math.abs(yawError) > plan.launchEnvelope().yawTolerance()
-                || !plan.launchEnvelope().containsVelocity(player.getVelocity())) {
-            if (!isLaunchYawAligned(yawError)) smoothYaw(player, desiredYaw);
-            return StepTickResult.RUNNING;
-        }
-        launchAligned = true;
-        alignmentTicks = 0;
-        return StepTickResult.RUNNING;
-    }
-
-    private boolean insideLaunchEnvelope(PlayerEntity player) {
-        return plan.launchEnvelope().containsPosition(player.getPos())
-                && player.getVelocity().horizontalLength()
-                    <= Math.max(0.06, plan.launchEnvelope().maximumForwardSpeed() + 0.02);
-    }
-
-    private boolean currentStateLaunchDrifted(PlayerEntity player) {
-        return plan.currentStateLaunch() && (!plan.launchEnvelope().containsPosition(player.getPos())
-                || !plan.launchEnvelope().containsVelocity(player.getVelocity()));
-    }
-
-    private StepTickResult executeTrajectory(MinecraftClient client, PlayerEntity player,
-                                             boolean targetSupported) {
-        if (!player.isOnGround() && !launched) {
-            release(client);
-            return fail("Approach left its support before the planned jump transition.");
-        }
-        if (frameIndex >= plan.controlFrames().size()) {
-            if (!player.isOnGround() && launched) {
-                ControlFrame recovery = runtimeAirborneControl(ParkourState.capture(PlayerSnapshot.capture(player)),
-                        lastAirborneFrame(), plan.controlFrames().size() - 1);
-                applyFrame(client, player, recovery, false);
-                launched = true;
-                return StepTickResult.RUNNING;
-            }
-            release(client);
-            return fail("The executed route exhausted its controls before reaching target support.");
-        }
-
-        ControlFrame planned = plan.controlFrames().get(frameIndex);
-        if (!planned.guard().permits(player.isOnGround(), targetSupported)) {
-            if (!player.isOnGround()) {
-                if (!launched) {
-                    release(client);
-                    return fail("Approach left support without a confirmed jump impulse.");
+        if (command.advancePlan) {
+            controlIndex = Math.max(controlIndex, command.planIndex + 1);
+            if (phase == ControllerPhase.APPROACH_TRACKING) {
+                double positionResidual = horizontalDistance(observed.feetPosition(),
+                        command.expected.state().feetPosition());
+                double velocityResidual = observed.velocity().subtract(
+                        command.expected.state().velocity()).horizontalLength();
+                if (positionResidual > PRECOMMIT_POSITION_LIMIT
+                        || velocityResidual > PRECOMMIT_VELOCITY_LIMIT) {
+                    movementIO.release(client);
+                    return replan(String.format("Approach transition diverged before commitment "
+                                    + "(position %.3f, velocity %.3f, epoch %d).",
+                            positionResidual, velocityResidual, command.epoch));
                 }
-                ControlFrame recovery = runtimeAirborneControl(ParkourState.capture(PlayerSnapshot.capture(player)),
-                        lastAirborneFrame(), frameIndex);
-                applyFrame(client, player, recovery, false);
-                launched = true;
-                return StepTickResult.RUNNING;
             }
-            release(client);
-            return StepTickResult.RUNNING;
         }
+        if (phase == ControllerPhase.CONTACT_TRANSIT && targetSupported) {
+            phase = ControllerPhase.LANDING;
+        }
+        return null;
+    }
 
-        boolean jump = planned.jump() && !jumpCommanded && !launched;
-        if (jump && plan.launchLane() != null) {
-            TakeoffDecision decision = takeoffDecision(
-                    ParkourState.capture(PlayerSnapshot.capture(player)), planned, frameIndex);
-            if (decision == TakeoffDecision.ABORT) {
-                release(client);
-                return fail("No validated takeoff state remained before the safe edge.");
+    private StepTickResult tickStaging(ParkourState state, MinecraftClient client) {
+        if (!state.onGround() || support(state) != SupportKind.TAKEOFF) {
+            movementIO.release(client);
+            return fail("Staging lost the supported approach region; automatic replanning was refused.");
+        }
+        stagingTicks++;
+        Box staging = plan.approachPlan().stagingRegion();
+        double distance = distanceToBox(state.feetPosition(), staging);
+        float yawError = Math.abs(MathHelper.wrapDegrees(
+                launchEnvelope.desiredYaw() - state.yaw()));
+        double progressScore = distance * 20
+                + state.velocity().horizontalLength() * 4
+                + yawError * 0.02;
+        if (progressScore < bestStagingScore - 0.02) {
+            bestStagingScore = progressScore;
+            stalledTicks = 0;
+        } else if (distance > 0.025 || yawError > launchEnvelope.yawTolerance()) {
+            stalledTicks++;
+        }
+        if (stalledTicks >= STALL_TICKS) {
+            movementIO.release(client);
+            return replan(String.format("Staging made no useful progress for six controlled "
+                            + "observations (feet %.3f/%.3f, region %.3f..%.3f/%.3f..%.3f, "
+                            + "distance %.3f, speed %.3f, yaw %.2f).",
+                    state.feetPosition().x, state.feetPosition().z,
+                    staging.minX, staging.maxX, staging.minZ, staging.maxZ,
+                    distance, state.velocity().horizontalLength(), yawError));
+        }
+        if (stagingTicks > MAX_STAGING_TICKS) {
+            movementIO.release(client);
+            return replan("The staging region was not reached within 40 ticks. " + stagingDiagnostic);
+        }
+        boolean outcomeValidatedEntry = distance <= 0.10
+                && state.velocity().horizontalLength() <= 0.06
+                && yawError <= launchEnvelope.yawTolerance()
+                && stagingStateSupportsPlan(state);
+        if (outcomeValidatedEntry) {
+            if (++stagingObservations >= STAGING_OBSERVATIONS) {
+                phase = ControllerPhase.APPROACH_TRACKING;
+                controlIndex = 0;
+                approachValidated = true;
+                return tickApproach(state, client);
             }
-            if (decision == TakeoffDecision.APPROACH) {
+            return issue(state, neutral(ControlPhase.ALIGNING,
+                    launchEnvelope.desiredYaw()), -1, false, client);
+        }
+        stagingObservations = 0;
+        if (yawError > 6) {
+            return issue(state, neutral(ControlPhase.ALIGNING,
+                    launchEnvelope.desiredYaw()), -1, false, client);
+        }
+        return issue(state, stagingMpc(state, staging), -1, false, client);
+    }
+
+    private StepTickResult tickApproach(ParkourState state, MinecraftClient client) {
+        // Planning releases movement while it runs. A current-state seed's captured velocity
+        // may have decayed before delivery, so even a no-positioning plan needs a fresh replay.
+        if (!approachValidated) {
+            if (stagingStateSupportsPlan(state)) approachValidated = true;
+            else {
+                phase = ControllerPhase.STAGING;
+                return tickStaging(state, client);
+            }
+        }
+        if (!state.onGround() || support(state) != SupportKind.TAKEOFF
+                && !retainedGroundCommit(state, controlIndex)) {
+            movementIO.release(client);
+            return fail("The approach lost support before takeoff commitment; automatic replanning was refused.");
+        }
+        if (controlIndex >= plan.controlFrames().size() || jumpIndex >= plan.controlFrames().size()) {
+            movementIO.release(client);
+            return fail("The plan contains no executable jump transition.");
+        }
+        if (controlIndex < jumpIndex) {
+            TrajectorySample expected = expectedSample(controlIndex);
+            if (horizontalDistance(state.feetPosition(), expected.feetPosition())
+                    > PRECOMMIT_POSITION_LIMIT
+                    || state.velocity().subtract(expected.velocity()).horizontalLength()
+                    > PRECOMMIT_VELOCITY_LIMIT) {
+                movementIO.release(client);
+                return replan("The observed approach state left its validated state tube.");
+            }
+            ControlFrame approach = plan.controlFrames().get(controlIndex);
+            ParkourState next;
+            try { next = physics.tickState(world, state, input(state, approach)); }
+            catch (RuntimeException exception) {
+                movementIO.release(client);
+                return replan("The next approach command left the captured physics region.");
+            }
+            if (!next.onGround() || support(next) != SupportKind.TAKEOFF
+                    && !retainedGroundCommit(next, controlIndex + 1)) {
+                // Validate departure AND the following jump as a pair before spending the last
+                // supported command. Never discover a missed launch tube after walking off.
+                movementIO.release(client);
+                return replan("Stopped before the edge: the next approach command would miss the validated jump state.");
+            }
+            return issue(state, approach, controlIndex, true, client);
+        }
+        ControlFrame jump = plan.controlFrames().get(jumpIndex);
+        TakeoffDecision decision = takeoffDecision(state, jump, jumpIndex);
+        if (decision == TakeoffDecision.ABORT) {
+            movementIO.release(client);
+            return replan(takeoffMissReason(state, jump));
+        }
+        if (decision == TakeoffDecision.APPROACH) {
+            ControlFrame approach = new ControlFrame(1, jump.strafe(), jump.sprint(), false,
+                    false, jump.desiredYaw(), ControlPhase.RUN_UP, FrameGuard.GROUNDED);
+            return issue(state, approach, jumpIndex, false, client);
+        }
+        phase = ControllerPhase.TAKEOFF_COMMITTED;
+        takeoffFrame = jump;
+        takeoffFeetY = state.feetPosition().y;
+        takeoffLatchEpochs = 1;
+        return issue(state, jump, jumpIndex, false, client);
+    }
+
+    private StepTickResult tickCommitted(ParkourState state, MinecraftClient client) {
+        if (!state.onGround()) {
+            movementIO.release(client);
+            return fail("Takeoff became airborne before its command epoch was acknowledged.");
+        }
+        return StepTickResult.RUNNING;
+    }
+
+    private StepTickResult tickAirborne(ParkourState state, MinecraftClient client) {
+        if (state.onGround()) {
+            if (!targetSupported(state)) {
+                LadderColumn exit = ladderColumns.stream().filter(column -> column.supportsExit(state))
+                        .findFirst().orElse(null);
+                if (exit != null) return issue(state, LadderContinuation.choose(world, physics, state,
+                        exit, exit.exit(plan.landingZone())), controlIndex, false, client);
+                movementIO.release(client);
+                return fail("Wrong support: first grounded contact was outside the connected target.");
+            }
+            phase = ControllerPhase.LANDING;
+            return tickLanding(state, client);
+        }
+        LadderColumn attached = attachedColumn(state);
+        if (attached != null) {
+            if (++ladderRecoveryTicks > 120) {
+                movementIO.release(client);
+                return fail("Ladder attachment did not reach its exit within 120 observations.");
+            }
+            // Attachment is an observed mode, not a position on the nominal flight clock.
+            // A late catch may need a full climb even after the original flight frames end.
+            airborneExtraTicks = 0;
+            return issue(state, LadderContinuation.choose(world, physics, state, attached,
+                    attached.exit(plan.landingZone())), controlIndex, false, client);
+        }
+        controlIndex = Math.max(controlIndex, matchedAirborneIndex(state));
+        int plannedIndex = nextAirborneIndex(controlIndex);
+        ControlFrame planned = plannedIndex >= 0 ? plan.controlFrames().get(plannedIndex)
+                : airborneFrame(0, 0, false, launchEnvelope.desiredYaw());
+        if (plannedIndex < 0) {
+            if (++airborneExtraTicks > 12) {
+                movementIO.release(client);
+                return fail("The airborne route exhausted its recovery horizon.");
+            }
+            plannedIndex = Math.min(controlIndex, plan.controlFrames().size() - 1);
+        }
+        return issue(state, selectAirborneControl(state, planned, plannedIndex),
+                plannedIndex, true, client);
+    }
+
+    private StepTickResult tickLanding(ParkourState state, MinecraftClient client) {
+        LandingStabilityTracker.State landing = landingTracker.observe(state.boundingBox(),
+                state.feetPosition(), state.velocity(), state.onGround(), true);
+        if (landing == LandingStabilityTracker.State.FAILED) {
+            movementIO.release(client);
+            return fail(landingTracker.reason());
+        }
+        if (landing == LandingStabilityTracker.State.STABLE) {
+            if (!requiredContactsSatisfied()) {
+                movementIO.release(client);
+                return fail("The landing succeeded without the route's required contact event.");
+            }
+            movementIO.release(client);
+            return StepTickResult.COMPLETE;
+        }
+        return issue(state, selectLandingControl(state), -1, false, client);
+    }
+
+    private StepTickResult issue(ParkourState state, ControlFrame requested, int planIndex,
+                                 boolean advancePlan, MinecraftClient client) {
+        if (pending != null) return StepTickResult.RUNNING;
+        boolean target = targetSupported(state);
+        ControlFrame frame = guardedFrame(state, requested, target);
+        PhysicsStep expected;
+        try { expected = physics.tick(world, state, input(state, frame)); }
+        catch (RuntimeException exception) { return fail("Physics rejected the next movement command."); }
+        long epoch;
+        try { epoch = movementIO.apply(client, frame, target); }
+        catch (RuntimeException exception) { return fail("The movement command could not be applied."); }
+        pending = new PendingCommand(epoch, frame, expected, planIndex, advancePlan,
+                frame.jump() && phase == ControllerPhase.TAKEOFF_COMMITTED);
+        return StepTickResult.RUNNING;
+    }
+
+    private ControlFrame stagingMpc(ParkourState state, Box staging) {
+        float yaw = launchEnvelope.desiredYaw();
+        List<ControlFrame> actions = new java.util.ArrayList<>();
+        for (float forward : new float[]{-1, 0, 1}) {
+            for (float strafe : new float[]{-1, 0, 1}) {
+                actions.add(groundFrame(forward, strafe, yaw));
+            }
+        }
+        boolean refining = distanceToBox(state.feetPosition(), staging) < 0.25;
+        if (refining) {
+            // Binary keys at one fixed yaw form a coarse positioning lattice. Small real
+            // camera rotations add physically executable fine-positioning directions.
+            for (float delta : new float[]{-6, -3, 3, 6}) {
+                for (float forward : new float[]{-1, 0, 1}) {
+                    for (float strafe : new float[]{-1, 0, 1}) {
+                        if (forward != 0 || strafe != 0) actions.add(groundFrame(forward, strafe, yaw + delta));
+                    }
+                }
+            }
+        }
+        List<StagingNode> frontier = List.of(new StagingNode(state, actions.get(4), 0));
+        for (int depth = 0; depth < (refining ? 6 : MPC_HORIZON); depth++) {
+            java.util.Map<StagingKey, StagingNode> next = new LinkedHashMap<>();
+            for (StagingNode node : frontier) {
+                for (ControlFrame action : actions) {
+                    // Refine the first command's heading, then hold it or return to the lane
+                    // within this short rollout. Branching all five camera angles at every
+                    // depth spent most frame time on redundant yaw chatter. We still re-solve
+                    // from the observed state next tick and simulate every retained transition.
+                    if (depth > 0 && action.desiredYaw() != yaw
+                            && action.desiredYaw() != node.first.desiredYaw()) continue;
+                    ParkourState advanced;
+                    try { advanced = physics.tickState(world, node.state,
+                            input(node.state, action)); }
+                    catch (RuntimeException exception) { continue; }
+                    if (!advanced.onGround() || support(advanced) != SupportKind.TAKEOFF) continue;
+                    ControlFrame first = depth == 0 ? action : node.first;
+                    // Running cost prevents receding-horizon procrastination: a terminal-only
+                    // score repeatedly chose "wait now, move at the end of the horizon".
+                    double score = node.score + stagingScore(advanced, staging);
+                    StagingKey key = new StagingKey(Math.round(advanced.feetPosition().x * 100),
+                            Math.round(advanced.feetPosition().z * 100),
+                            Math.round(advanced.velocity().x * 100), Math.round(advanced.velocity().z * 100));
+                    StagingNode existing = next.get(key);
+                    if (existing == null || score < existing.score) {
+                        next.put(key, new StagingNode(advanced, first, score));
+                    }
+                }
+            }
+            frontier = next.values().stream()
+                    .sorted(Comparator.comparingDouble(StagingNode::score))
+                    .limit(refining ? 96 : 32).toList();
+            if (frontier.isEmpty()) return actions.get(4);
+        }
+        return frontier.stream().min(Comparator.comparingDouble(node -> node.score
+                + stagingScore(node.state, staging) * (refining ? 100 : 8))).orElseThrow().first;
+    }
+
+    private double stagingScore(ParkourState state, Box staging) {
+        // Project friction-only resting position for ranking; all actual transitions are
+        // still simulated with shapes/support above. Aim into the region, not its nearest rim.
+        Vec3d resting = state.feetPosition().add(state.velocity().multiply(1 / (1 - 0.546)));
+        Vec3d center = new Vec3d((staging.minX + staging.maxX) / 2, state.feetPosition().y,
+                (staging.minZ + staging.maxZ) / 2);
+        return distanceToBox(resting, staging) * 24
+                + horizontalDistance(resting, center) * 8
+                + distanceToBox(state.feetPosition(), staging) * 2
+                + state.velocity().horizontalLength()
+                + Math.abs(MathHelper.wrapDegrees(
+                    launchEnvelope.desiredYaw() - state.yaw())) * 0.02;
+    }
+
+    /**
+     * Binary movement keys cannot place the player at every real-valued coordinate in a tiny
+     * perturbation box. When a nearby settled state replays the complete immutable plan safely,
+     * it is a stronger admission test than endlessly oscillating around the box boundary.
+     */
+    private boolean stagingStateSupportsPlan(ParkourState initial) {
+        List<ParkourState> states = replayStagingRoute(initial, 0);
+        if (states == null || jumpIndex >= states.size()) {
+            stagingDiagnostic = "The nearby state did not preserve the route's nominal landing/contact.";
+            return false;
+        }
+        ParkourState launch = states.get(jumpIndex);
+        boolean insideEnvelope = launchEnvelope.containsPosition(launch.feetPosition())
+                && launchEnvelope.containsVelocity(launch.velocity());
+        // Rebase only after proving the same immutable controls and the entire contact
+        // contract from the actual staging state, including a fresh launch tolerance tube.
+        Vec3d heading = launchEnvelope.routeHeading();
+        Vec3d side = ControlInput.strafeDirection(heading);
+        double positionTolerance = Math.min(0.025, plan.launchEnvelope().maximumPositionError());
+        double speedTolerance = Math.min(0.02, plan.launchEnvelope().maximumVelocityError());
+        float yawTolerance = Math.min(1.5f, plan.launchEnvelope().yawTolerance());
+        boolean strict = plan.routeMode() != RouteMode.DIRECT;
+        double[] minimum = {0, 0}, maximum = {0, 0};
+        double minimumSpeed = 0, maximumSpeed = 0;
+        float validatedYaw = yawTolerance;
+        int axisIndex = 0;
+        if (!insideEnvelope) {
+            for (Vec3d axis : List.of(heading, side)) {
+                for (double offset : new double[]{-positionTolerance, positionTolerance}) {
+                    if (replayStagingRoute(perturbed(launch, axis.multiply(offset), Vec3d.ZERO, 0), jumpIndex) == null) {
+                        stagingDiagnostic = "The rebased position tube failed at offset " + axis.multiply(offset);
+                        if (strict) return false;
+                    } else if (offset < 0) minimum[axisIndex] = offset;
+                    else maximum[axisIndex] = offset;
+                }
+                axisIndex++;
+            }
+            for (double offset : new double[]{-speedTolerance, speedTolerance}) {
+                if (replayStagingRoute(perturbed(launch, Vec3d.ZERO, heading.multiply(offset), 0), jumpIndex) == null) {
+                    stagingDiagnostic = "The rebased speed tube failed at offset " + offset;
+                    if (strict) return false;
+                } else if (offset < 0) minimumSpeed = offset;
+                else maximumSpeed = offset;
+            }
+            for (float offset : new float[]{-yawTolerance, yawTolerance}) {
+                if (replayStagingRoute(perturbed(launch, Vec3d.ZERO, Vec3d.ZERO, offset), jumpIndex) == null) {
+                    stagingDiagnostic = "The rebased yaw tube failed at offset " + offset;
+                    if (strict) return false;
+                    validatedYaw = 0;
+                }
+            }
+            Vec3d feet = launch.feetPosition();
+            double speed = launch.velocity().dotProduct(heading);
+            launchEnvelope = new LaunchEnvelope(new Box(feet.x - 0.04, feet.y - 0.06, feet.z - 0.04,
+                    feet.x + 0.04, feet.y + 0.18, feet.z + 0.04), launch.velocity(), positionTolerance, speedTolerance,
+                    launchEnvelope.desiredYaw(), validatedYaw, feet, heading,
+                    minimum[0], maximum[0], minimum[1], maximum[1],
+                    speed + minimumSpeed, speed + maximumSpeed);
+        }
+        // Always rebase the reference prefix, including when its launch already fits the old
+        // envelope. Otherwise accumulated staging velocity is compared with a stale trajectory.
+        java.util.ArrayList<TrajectorySample> samples = new java.util.ArrayList<>();
+        for (int index = 0; index < states.size(); index++) {
+            ParkourState state = states.get(index);
+            var contact = SupportResolver.resolve(state.boundingBox(), state.feetPosition(), state.onGround(),
+                    plan.landingRegion(), plan.approachPlan().supportRegion(), world);
+            samples.add(new TrajectorySample(index, state.feetPosition(), state.velocity(), state.boundingBox(),
+                    state.onGround(), state.horizontalCollision(), state.verticalCollision(),
+                    plan.predictedTrajectory().get(Math.min(index, plan.predictedTrajectory().size() - 1)).phase(),
+                    contact.kind(), contact.targetSupported() ? contact.overlapArea() : 0));
+        }
+        referenceTrajectory = List.copyOf(samples);
+        return true;
+    }
+
+    private ParkourState perturbed(ParkourState base, Vec3d position, Vec3d velocity, float yaw) {
+        return new ParkourState(base.feetPosition().add(position), base.velocity().add(velocity),
+                base.boundingBox().offset(position), base.yaw() + yaw, base.onGround(), base.sprinting(),
+                base.jumpUsed(), base.horizontalCollision(), base.verticalCollision(), base.elapsedTicks(),
+                base.baseMovementSpeed(), base.jumpStrength(), base.stepHeight(), base.gravity(), base.activeEffects(),
+                base.previousSneak(), base.sneakingSpeed(), base.collidedSoftly(),
+                base.sprintTapTicks(), base.previousForward(), base.sprintAllowed());
+    }
+
+    private List<ParkourState> replayStagingRoute(ParkourState initial, int firstFrame) {
+        if (support(initial) != SupportKind.TAKEOFF
+                && !(firstFrame == jumpIndex && initial.onGround()
+                    && expectedSample(jumpIndex).support() == SupportKind.NONE)
+                || world.collisionBoxes(initial.boundingBox()).stream().anyMatch(initial.boundingBox()::intersects))
+            return null;
+        ParkourState state = initial;
+        boolean airborne = false;
+        Set<String> required = new LinkedHashSet<>();
+        java.util.ArrayList<ParkourState> states = new java.util.ArrayList<>();
+        states.add(state);
+        for (int tick = firstFrame; tick < plan.controlFrames().size(); tick++) {
+            ControlFrame frame = plan.controlFrames().get(tick);
+            LadderColumn column = attachedColumn(state);
+            if (column != null) frame = LadderContinuation.choose(world, physics, state, column,
+                    column.exit(plan.landingZone()));
+            ControlInput input = new ControlInput(frame.forward(), frame.strafe(), frame.sprint(),
+                    frame.jump() && (state.onGround() || ladderAttached(state)),
+                    frame.sneak() && (targetSupported(state) || frame.phase() == ControlPhase.LADDER && ladderAttached(state)),
+                    boundedYaw(state.yaw(), frame.desiredYaw()));
+            PhysicsStep step;
+            try { step = physics.tick(world, state, input); }
+            catch (RuntimeException exception) { return null; }
+            if (isAvoidanceRoute() && step.collisions().contacts().stream()
+                    .anyMatch(contact -> !contact.support())) return null;
+            for (CollisionContact contact : step.collisions().contacts()) {
+                if (contact.support()) continue;
+                for (ContactEvent event : plan.contactEvents()) {
+                    if (event.requirement() == ContactRequirement.REQUIRED
+                            && tick >= event.earliestTick() && tick <= event.latestTick()
+                            && event.featureId().equals(contact.featureId())
+                            && sameNormalClass(event, contact)) {
+                        required.add(event.featureId() + ":" + event.face());
+                    }
+                }
+            }
+            state = step.state();
+            states.add(state);
+            airborne |= !state.onGround();
+            if (!airborne && support(state) != SupportKind.TAKEOFF
+                    && !(tick + 1 == jumpIndex && state.onGround()
+                        && expectedSample(jumpIndex).support() == SupportKind.NONE)) return null;
+            if (airborne && state.onGround() && !targetSupported(state)
+                    && ladderColumns.stream().noneMatch(value -> value.supportsExit(step.state()))) return null;
+        }
+        return airborne && state.onGround() && targetSupported(state)
+                && plan.contactEvents().stream()
+                    .filter(event -> event.requirement() == ContactRequirement.REQUIRED)
+                    .allMatch(event -> required.contains(event.featureId() + ":" + event.face()))
+                && state.velocity().horizontalLength() <= LandingStabilityTracker.MAX_FINAL_SPEED
+                ? List.copyOf(states) : null;
+    }
+
+    ControlFrame selectLandingControl(ParkourState state) {
+        float yaw = launchEnvelope.desiredYaw();
+        ControlFrame neutral = landingFrame(0, 0, false, yaw);
+        // Low speed is not itself safe: a few millimetres of residual motion can still
+        // leave a legal fringe landing. Prove the neutral tail before releasing braking.
+        if (stoppingSurvives(state, neutral)) return neutral;
+        ControlFrame counter = counterLandingFrame(state, yaw);
+        if (stoppingSurvives(state, counter)) return counter;
+        ControlFrame sneak = landingFrame(0, 0, true, yaw);
+        return stoppingSurvives(state, sneak) ? sneak : counter;
+    }
+
+    private ControlFrame counterLandingFrame(ParkourState state, float yaw) {
+        Vec3d heading = launchEnvelope.routeHeading();
+        Vec3d side = ControlInput.strafeDirection(heading);
+        Vec3d opposite = new Vec3d(state.velocity().x, 0, state.velocity().z).normalize().multiply(-1);
+        return landingFrame(
+                (float) MathHelper.clamp(opposite.dotProduct(heading), -1, 1),
+                (float) MathHelper.clamp(opposite.dotProduct(side), -1, 1), false, yaw);
+    }
+
+    private boolean stoppingSurvives(ParkourState initial, ControlFrame frame) {
+        ParkourState state = initial;
+        boolean braking = frame.forward() != 0 || frame.strafe() != 0;
+        for (int tick = 0; tick < LandingStabilityTracker.REQUIRED_GROUNDED_TICKS
+                + LandingStabilityTracker.REQUIRED_SETTLE_TICKS; tick++) {
+            // Match planning's closed-loop stop: counter the remaining velocity, then
+            // release. Repeating the first backward key for six ticks drove the rollout
+            // off the opposite edge and falsely made harmless braking look impossible.
+            ControlFrame next = frame;
+            if (braking) next = state.velocity().horizontalLength() <= LandingStabilityTracker.MAX_FINAL_SPEED
+                    ? landingFrame(0, 0, false, frame.desiredYaw())
+                    : counterLandingFrame(state, frame.desiredYaw());
+            try { state = physics.tick(world, state, input(state, next)).state(); }
+            catch (RuntimeException exception) { return false; }
+            if (!targetSupported(state) || !state.onGround()) return false;
+        }
+        return state.velocity().horizontalLength() <= LandingStabilityTracker.MAX_FINAL_SPEED;
+    }
+
+    ControlFrame selectAirborneControl(ParkourState observed, ControlFrame planned, int plannedIndex) {
+        LadderColumn column = attachedColumn(observed);
+        if (column != null) return LadderContinuation.choose(world, physics, observed, column,
+                column.exit(plan.landingZone()));
+        TrajectorySample expected = expectedSample(plannedIndex);
+        if (!requiresAirborneRecovery(observed, expected) && airActionAllowed(observed, planned)) {
+            return planned;
+        }
+        List<ControlFrame> choices = List.of(planned,
+                airborneFrame(0, 0, false, planned.desiredYaw()),
+                airborneFrame(-1, 0, false, planned.desiredYaw()),
+                airborneFrame(planned.forward(), -1, planned.sprint(), planned.desiredYaw()),
+                airborneFrame(planned.forward(), 1, planned.sprint(), planned.desiredYaw()));
+        return choices.stream().filter(choice -> airActionAllowed(observed, choice))
+                .min(Comparator.comparingDouble(choice -> airMpcScore(observed, choice,
+                        plannedIndex, choice == planned ? -0.01 : 0)))
+                .orElse(airborneFrame(0, 0, false, planned.desiredYaw()));
+    }
+
+    private boolean airActionAllowed(ParkourState state, ControlFrame frame) {
+        try {
+            PhysicsStep step = physics.tick(world, state, input(state, frame));
+            return !isAvoidanceRoute() || step.collisions().contacts().stream()
+                    .noneMatch(contact -> !contact.support());
+        } catch (RuntimeException exception) { return false; }
+    }
+
+    private double airMpcScore(ParkourState initial, ControlFrame first,
+                               int plannedIndex, double preference) {
+        ParkourState state = initial;
+        double score = preference;
+        for (int tick = 0; tick < MPC_HORIZON; tick++) {
+            ControlFrame frame = tick == 0 ? first : nextAirborneFrame(plannedIndex + tick);
+            PhysicsStep step;
+            try { step = physics.tick(world, state, input(state, frame)); }
+            catch (RuntimeException exception) { return Double.MAX_VALUE; }
+            if (isAvoidanceRoute() && step.collisions().contacts().stream()
+                    .anyMatch(contact -> !contact.support())) return Double.MAX_VALUE;
+            state = step.state();
+            if (state.onGround()) {
+                return targetSupported(state) ? -100_000
+                        - SupportResolver.edgeMargin(state.boundingBox(), state.feetPosition().y,
+                            plan.landingRegion()) * 100 : 1_000_000;
+            }
+            TrajectorySample expected = expectedSample(plannedIndex + tick + 1);
+            score += state.feetPosition().squaredDistanceTo(expected.feetPosition()) * 2
+                    + state.velocity().squaredDistanceTo(expected.velocity());
+        }
+        return score + SupportResolver.distanceToRegion(state.feetPosition(),
+                plan.landingRegion()) * 10;
+    }
+
+    TakeoffDecision takeoffDecision(ParkourState observed, ControlFrame planned, int plannedIndex) {
+        if (retainedGroundCommit(observed, plannedIndex)) return TakeoffDecision.JUMP_NOW;
+        if (!observed.onGround() || support(observed) != SupportKind.TAKEOFF) {
+            return TakeoffDecision.ABORT;
+        }
+        float yawError = Math.abs(MathHelper.wrapDegrees(planned.desiredYaw() - observed.yaw()));
+        if (launchEnvelope.containsPosition(observed.feetPosition())
+                && launchEnvelope.containsVelocity(observed.velocity())
+                && takeoffYawReachable(yawError)) {
+            return TakeoffDecision.JUMP_NOW;
+        }
+        double remaining = plan.launchLane() == null ? 0
+                : plan.launchLane().distanceBeforeEdge(observed.feetPosition());
+        if (plan.launchLane() != null && remaining >= plan.launchLane().triggerMinimum()
+                && remaining <= plan.launchLane().triggerMaximum() + 0.20) {
+            try {
                 ControlFrame approach = new ControlFrame(1, planned.strafe(), planned.sprint(),
                         false, false, planned.desiredYaw(), ControlPhase.RUN_UP, FrameGuard.GROUNDED);
-                applyFrame(client, player, approach, false);
-                runUpStarted = true;
-                return StepTickResult.RUNNING;
-            }
+                ParkourState next = physics.tick(world, observed, input(observed, approach)).state();
+                float nextYawError = Math.abs(MathHelper.wrapDegrees(
+                        planned.desiredYaw() - next.yaw()));
+                if (next.onGround() && support(next) == SupportKind.TAKEOFF
+                        && launchEnvelope.containsPosition(next.feetPosition())
+                        && launchEnvelope.containsVelocity(next.velocity())
+                        && takeoffYawReachable(nextYawError)) {
+                    return TakeoffDecision.APPROACH;
+                }
+            } catch (RuntimeException ignored) { }
         }
-
-        if (jump && plan.launchLane() != null && !plan.launchLane().inTriggerInterval(player.getPos())) {
-            double remaining = plan.launchLane().distanceBeforeEdge(player.getPos());
-            if (remaining < plan.launchLane().triggerMinimum() - 0.05) {
-                return fail("The launch trigger interval was passed before takeoff.");
-            }
-            ControlFrame approach = new ControlFrame(planned.forward(), planned.strafe(), planned.sprint(),
-                    false, false, planned.desiredYaw(), ControlPhase.RUN_UP, FrameGuard.GROUNDED);
-            applyFrame(client, player, approach, false);
-            runUpStarted = true;
-            return StepTickResult.RUNNING;
-        }
-        ControlFrame guarded = new ControlFrame(planned.forward(), planned.strafe(), planned.sprint(), jump,
-                false, planned.desiredYaw(), planned.phase(), planned.guard());
-        ControlFrame corrected = !player.isOnGround()
-                ? runtimeAirborneControl(ParkourState.capture(PlayerSnapshot.capture(player)),
-                    guarded, frameIndex) : guarded;
-        applyFrame(client, player, corrected, false);
-        runUpStarted |= corrected.phase() == ControlPhase.RUN_UP || corrected.phase() == ControlPhase.TAKEOFF;
-        if (jump) {
-            // Command issuance is not takeoff acknowledgement. Keep this frame pending until
-            // Minecraft exposes upward motion (or the expected head-contact rise) next tick.
-            jumpCommanded = true;
-            pendingTakeoffFrame = corrected;
-            takeoffCommandFeetY = player.getY();
-            jumpWaitTicks = 0;
-            return StepTickResult.RUNNING;
-        }
-        frameIndex++;
-        return StepTickResult.RUNNING;
+        return TakeoffDecision.ABORT;
     }
 
-    private StepTickResult acknowledgeTakeoff(MinecraftClient client, PlayerEntity player) {
-        double verticalDisplacement = player.getY() - takeoffCommandFeetY;
-        if (isTakeoffConfirmed(player.isOnGround(), verticalDisplacement,
-                player.getVelocity().y, player.verticalCollision)) {
-            launched = true;
-            client.options.jumpKey.setPressed(false);
-            frameIndex++;
-            jumpWaitTicks = 0;
-            return null;
-        }
-        if (!player.isOnGround()) {
-            release(client);
-            return fail("Missed takeoff: the player walked off support without receiving a jump impulse.");
-        }
-        if (++jumpWaitTicks <= 2 && pendingTakeoffFrame != null
-                && plan.launchLane() != null
-                && plan.launchLane().inTriggerInterval(player.getPos())) {
-            applyFrame(client, player, pendingTakeoffFrame, false);
-            return StepTickResult.RUNNING;
-        }
-        release(client);
-        return fail("The jump command was not accepted inside the launch window.");
+    /** Vanilla resolves vertical support before horizontal edge departure. Only the exact
+     * acknowledged final ground state may use that flag; it can issue jump, never another run tick. */
+    private boolean retainedGroundCommit(ParkourState observed, int index) {
+        if (index != jumpIndex || !observed.onGround() || support(observed) != SupportKind.NONE) return false;
+        TrajectorySample expected = expectedSample(jumpIndex);
+        return expected.onGround() && expected.support() == SupportKind.NONE
+                && launchEnvelope.containsPosition(observed.feetPosition())
+                && launchEnvelope.containsVelocity(observed.velocity())
+                && takeoffYawReachable(Math.abs(MathHelper.wrapDegrees(
+                        plan.controlFrames().get(jumpIndex).desiredYaw() - observed.yaw())));
     }
+
+    private int matchedAirborneIndex(ParkourState state) {
+        int best = Math.max(controlIndex, jumpIndex + 1);
+        double bestError = Double.MAX_VALUE;
+        for (int index = best; index <= Math.min(plan.controlFrames().size() - 1, best + 2); index++) {
+            if (!plan.controlFrames().get(index).phase().isTransitPhase()) continue;
+            TrajectorySample sample = expectedSample(index);
+            double error = state.feetPosition().squaredDistanceTo(sample.feetPosition())
+                    + state.velocity().squaredDistanceTo(sample.velocity()) * 2;
+            if (error < bestError) { bestError = error; best = index; }
+        }
+        return best;
+    }
+
+    private int nextAirborneIndex(int from) {
+        for (int index = Math.max(from, jumpIndex + 1); index < plan.controlFrames().size(); index++) {
+            if (plan.controlFrames().get(index).phase().isTransitPhase()) return index;
+        }
+        return -1;
+    }
+
+    private ControlFrame nextAirborneFrame(int from) {
+        int index = nextAirborneIndex(from);
+        if (index >= 0) {
+            ControlFrame frame = plan.controlFrames().get(index);
+            return frame;
+        }
+        return airborneFrame(0, 0, false, launchEnvelope.desiredYaw());
+    }
+
+    private void matchContacts(PendingCommand command, ParkourState observed) {
+        int tick = Math.max(0, command.planIndex);
+        for (CollisionContact contact : command.expected.collisions().contacts()) {
+            if (contact.support()) continue;
+            boolean observedClass = contact.face().headContact() ? observed.verticalCollision()
+                    : contact.face().sideContact() && observed.horizontalCollision();
+            if (!observedClass) continue;
+            for (ContactEvent event : plan.contactEvents()) {
+                if (event.requirement() != ContactRequirement.REQUIRED
+                        || tick < event.earliestTick() || tick > event.latestTick()) continue;
+                if (event.featureId().equals(contact.featureId()) && sameNormalClass(event, contact)) {
+                    satisfiedContacts.add(event.featureId() + ":" + event.face());
+                }
+            }
+        }
+    }
+
+    private boolean sameNormalClass(ContactEvent event, CollisionContact contact) {
+        if (event.face().headContact()) return contact.face().headContact();
+        if (!event.face().sideContact() || !contact.face().sideContact()) return event.face() == contact.face();
+        return (event.face().normal().x != 0) == (contact.face().normal().x != 0);
+    }
+
+    private boolean requiredContactsSatisfied() {
+        return plan.contactEvents().stream()
+                .filter(event -> event.requirement() == ContactRequirement.REQUIRED)
+                .allMatch(event -> satisfiedContacts.contains(event.featureId() + ":" + event.face()));
+    }
+
+    private ControlFrame guardedFrame(ParkourState state, ControlFrame frame,
+                                      boolean targetSupported) {
+        boolean ladder = frame.phase() == ControlPhase.LADDER && !state.onGround() && ladderAttached(state);
+        return new ControlFrame(frame.forward(), frame.strafe(), frame.sprint(),
+                frame.jump() && (state.onGround() && phase == ControllerPhase.TAKEOFF_COMMITTED || ladder),
+                frame.allowsSneak(state.onGround(), targetSupported, ladder), boundedYaw(state.yaw(), frame.desiredYaw()),
+                frame.phase(), frame.guard());
+    }
+
+    private ControlInput input(ParkourState state, ControlFrame frame) {
+        boolean ladder = !state.onGround() && ladderAttached(state);
+        return new ControlInput(frame.forward(), frame.strafe(), frame.sprint(),
+                frame.jump() && (frame.phase() != ControlPhase.LADDER || ladder),
+                frame.allowsSneak(state.onGround(), targetSupported(state), ladder),
+                boundedYaw(state.yaw(), frame.desiredYaw()));
+    }
+
+    private boolean ladderAttached(ParkourState state) {
+        return world.isLadder(net.minecraft.util.math.BlockPos.ofFloored(state.feetPosition()));
+    }
+
+    private LadderColumn attachedColumn(ParkourState state) {
+        return state.onGround() ? null : ladderColumns.stream()
+                .filter(column -> column.contains(state.feetPosition())).findFirst().orElse(null);
+    }
+
+    private float boundedYaw(float current, float desired) {
+        return current + MathHelper.clamp(MathHelper.wrapDegrees(desired - current),
+                -MAX_YAW_CHANGE, MAX_YAW_CHANGE);
+    }
+
+    static boolean takeoffYawReachable(float yawError) {
+        // Replay assumes this command's requested heading, not a clipped approximation.
+        // Launch-state yaw tolerance does not authorize extra command yaw error.
+        return yawError <= MAX_YAW_CHANGE + 1.0E-4;
+    }
+
+    private String takeoffMissReason(ParkourState state, ControlFrame jump) {
+        Vec3d relative = state.feetPosition().subtract(launchEnvelope.routeOrigin());
+        Vec3d side = ControlInput.strafeDirection(launchEnvelope.routeHeading());
+        double longitudinal = relative.dotProduct(launchEnvelope.routeHeading());
+        double lateral = relative.dotProduct(side);
+        double speed = state.velocity().dotProduct(launchEnvelope.routeHeading());
+        double yaw = Math.abs(MathHelper.wrapDegrees(jump.desiredYaw() - state.yaw()));
+        return String.format("No validated takeoff state remained before the safe edge "
+                        + "(longitudinal %.3f in [%.3f, %.3f], lateral %.3f in [%.3f, %.3f], "
+                        + "speed %.3f in [%.3f, %.3f], yaw %.2f/%.2f).",
+                longitudinal, launchEnvelope.minimumLongitudinal(),
+                launchEnvelope.maximumLongitudinal(), lateral,
+                launchEnvelope.minimumLateral(), launchEnvelope.maximumLateral(),
+                speed, launchEnvelope.minimumForwardSpeed(),
+                launchEnvelope.maximumForwardSpeed(), yaw,
+                launchEnvelope.yawTolerance());
+    }
+
+    private SupportKind support(ParkourState state) {
+        return SupportResolver.resolve(state.boundingBox(), state.feetPosition(), state.onGround(),
+                plan.landingRegion(), plan.approachPlan().supportRegion(), world).kind();
+    }
+
+    private boolean targetSupported(ParkourState state) {
+        return SupportResolver.targetSupported(state.boundingBox(), state.feetPosition(),
+                state.onGround(), plan.landingRegion());
+    }
+
+    private boolean isAvoidanceRoute() {
+        return plan.routeMode() == RouteMode.AVOID_LEFT || plan.routeMode() == RouteMode.AVOID_RIGHT;
+    }
+
+    private TrajectorySample expectedSample(int index) {
+        return referenceTrajectory.get(Math.min(Math.max(0, index), referenceTrajectory.size() - 1));
+    }
+
+    private ControlFrame neutral(ControlPhase phase, float yaw) {
+        return new ControlFrame(0, 0, false, false, false, yaw, phase, FrameGuard.GROUNDED);
+    }
+    private ControlFrame groundFrame(float forward, float strafe, float yaw) {
+        return new ControlFrame(forward, strafe, false, false, false, yaw,
+                ControlPhase.POSITIONING, FrameGuard.GROUNDED);
+    }
+    private ControlFrame airborneFrame(float forward, float strafe, boolean sprint, float yaw) {
+        return new ControlFrame(forward, strafe, sprint, false, false, yaw,
+                ControlPhase.AIRBORNE, FrameGuard.AIRBORNE);
+    }
+    private ControlFrame landingFrame(float forward, float strafe, boolean sneak, float yaw) {
+        return new ControlFrame(forward, strafe, false, false, sneak, yaw,
+                sneak || Math.abs(forward) + Math.abs(strafe) > 0
+                        ? ControlPhase.LANDED_BRAKING : ControlPhase.SETTLING,
+                FrameGuard.TARGET_GROUNDED);
+    }
+
+    private double distanceToBox(Vec3d point, Box box) {
+        double dx = Math.max(0, Math.max(box.minX - point.x, point.x - box.maxX));
+        double dz = Math.max(0, Math.max(box.minZ - point.z, point.z - box.maxZ));
+        return Math.hypot(dx, dz);
+    }
+    private double horizontalDistance(Vec3d first, Vec3d second) {
+        return Math.hypot(first.x - second.x, first.z - second.z);
+    }
+
+    private record StagingNode(ParkourState state, ControlFrame first, double score) { }
+    private record StagingKey(long x, long z, long vx, long vz) { }
 
     static boolean isTakeoffConfirmed(boolean onGround, double verticalDisplacement,
                                       double verticalVelocity) {
         return isTakeoffConfirmed(onGround, verticalDisplacement, verticalVelocity, false);
     }
-
     static boolean isTakeoffConfirmed(boolean onGround, double verticalDisplacement,
                                       double verticalVelocity, boolean upwardCollision) {
         return !onGround && (verticalDisplacement > 0.01 || verticalVelocity > 0.01
                 || upwardCollision && verticalDisplacement >= -0.001);
     }
-
-    TakeoffDecision takeoffDecision(ParkourState observed, ControlFrame planned, int controlIndex) {
-        if (stableJumpRollout(observed, planned, controlIndex)) return TakeoffDecision.JUMP_NOW;
-
-        ParkourState probe = observed;
-        ControlFrame approach = new ControlFrame(1, planned.strafe(), planned.sprint(), false,
-                false, planned.desiredYaw(), ControlPhase.RUN_UP, FrameGuard.GROUNDED);
-        for (int tick = 0; tick < MAX_TAKEOFF_LOOKAHEAD_TICKS; tick++) {
-            try { probe = physics.tick(world, probe, boundedInput(probe, approach)); }
-            catch (RuntimeException exception) { return TakeoffDecision.ABORT; }
-            if (!probe.onGround() || plan.launchLane().distanceBeforeEdge(probe.feetPosition())
-                    < plan.launchLane().triggerMinimum() - 0.02) return TakeoffDecision.ABORT;
-            boolean supported = SupportResolver.overlapArea(probe.boundingBox(), probe.feetPosition().y,
-                    List.of(plan.launchLane().takeoffSurface())) > 1.0E-4;
-            if (stableJumpRollout(probe, planned, controlIndex)) {
-                return supported || maximumReachLane()
-                        ? TakeoffDecision.APPROACH : TakeoffDecision.ABORT;
-            }
-            // Ordinary and obstacle lanes may never deliberately advance into a supportless
-            // coyote state. Only a true maximum platform gap is allowed to search that exact
-            // retained-ground transition.
-            if (!supported && !maximumReachLane()) return TakeoffDecision.ABORT;
-        }
-        return TakeoffDecision.ABORT;
-    }
-
-    private boolean stableJumpRollout(ParkourState state, ControlFrame planned, int controlIndex) {
-        if (!state.onGround() || planned.sprint() && !state.sprinting()) return false;
-        if (plan.launchLane().distanceBeforeEdge(state.feetPosition())
-                < plan.launchLane().triggerMinimum() - 0.02) return false;
-        return recoveryScore(state, planned, controlIndex, 0).stableTarget();
-    }
-
-    private boolean maximumReachLane() {
-        if (plan.launchLane() == null) return false;
-        double gap = plan.landingRegion().stream().mapToDouble(surface -> edgeDistance(
-                plan.launchLane().takeoffSurface().footprint(), surface.footprint()))
-                .min().orElse(Double.MAX_VALUE);
-        return gap >= 3.75;
-    }
-
-    private double edgeDistance(net.minecraft.util.math.Box first, net.minecraft.util.math.Box second) {
-        double dx = Math.max(0, Math.max(first.minX - second.maxX, second.minX - first.maxX));
-        double dz = Math.max(0, Math.max(first.minZ - second.maxZ, second.minZ - first.maxZ));
-        return Math.hypot(dx, dz);
-    }
-
-    private StepTickResult tickLanding(MinecraftClient client, PlayerEntity player) {
-        LandingStabilityTracker.State state = landingTracker.observe(player.getBoundingBox(), player.getPos(),
-                player.getVelocity(), player.isOnGround(), true);
-        if (state == LandingStabilityTracker.State.FAILED) return fail(landingTracker.reason());
-        if (state == LandingStabilityTracker.State.STABLE) {
-            release(client);
-            return StepTickResult.COMPLETE;
-        }
-
-        ControlFrame selected = selectLandingControl(player);
-        boolean allowSneak = isSneakAllowed(selected.phase(), player.isOnGround(),
-                targetSupported(player), selected.sneak()) && consecutiveSneakTicks < MAX_SNEAK_TICKS;
-        if (allowSneak) consecutiveSneakTicks++;
-        else consecutiveSneakTicks = 0;
-        ControlFrame guarded = new ControlFrame(selected.forward(), selected.strafe(), false, false,
-                allowSneak, selected.desiredYaw(), selected.phase(), FrameGuard.TARGET_GROUNDED);
-        applyFrame(client, player, guarded, true);
-        return StepTickResult.RUNNING;
-    }
-
-    private ControlFrame selectLandingControl(PlayerEntity player) {
-        float yaw = player.getYaw();
-        if (player.getVelocity().horizontalLength() <= LandingStabilityTracker.MAX_FINAL_SPEED) {
-            return new ControlFrame(0, 0, false, false, false, yaw,
-                    ControlPhase.SETTLING, FrameGuard.TARGET_GROUNDED);
-        }
-        List<ControlFrame> noSneak = List.of(
-                landingFrame(0, 0, false, yaw), landingFrame(-1, 0, false, yaw),
-                landingFrame(0, -1, false, yaw), landingFrame(0, 1, false, yaw));
-        List<LandingOutcome> outcomes = new ArrayList<>();
-        for (int index = 0; index < noSneak.size(); index++) {
-            outcomes.add(projectLanding(player, noSneak.get(index), index));
-        }
-        LandingOutcome bestNoSneak = outcomes.stream().max(Comparator
-                .comparingInt(LandingOutcome::supportedTicks)
-                .thenComparing((LandingOutcome outcome) -> -outcome.finalSpeed())
-                .thenComparing((LandingOutcome outcome) -> -outcome.preference())).orElseThrow();
-        if (bestNoSneak.supportedTicks == 6) return bestNoSneak.frame;
-
-        ControlFrame sneak = landingFrame(0, 0, true, yaw);
-        LandingOutcome sneakOutcome = projectLanding(player, sneak, 4);
-        return sneakOutcome.supportedTicks == 6 && bestNoSneak.supportedTicks < 6
-                ? sneak : bestNoSneak.frame;
-    }
-
-    private LandingOutcome projectLanding(PlayerEntity player, ControlFrame frame, int preference) {
-        PlayerSnapshot snapshot = PlayerSnapshot.capture(player);
-        ParkourState state = ParkourState.capture(snapshot);
-        int supported = 0;
-        for (int tick = 0; tick < 6; tick++) {
-            state = physics.tick(world, state, input(frame));
-            if (!SupportResolver.targetSupported(state.boundingBox(), state.feetPosition(), state.onGround(),
-                    plan.landingRegion())) break;
-            supported++;
-        }
-        return new LandingOutcome(frame, supported, state.velocity().horizontalLength(), preference);
-    }
-
-    private ControlFrame landingFrame(float forward, float strafe, boolean sneak, float yaw) {
-        ControlPhase phase = forward == 0 && strafe == 0 && !sneak
-                ? ControlPhase.SETTLING : ControlPhase.LANDED_BRAKING;
-        return new ControlFrame(forward, strafe, false, false, sneak, yaw,
-                phase, FrameGuard.TARGET_GROUNDED);
-    }
-
-    /**
-     * Keeps the validated control sequence authoritative inside a real-state deadband. Once
-     * outside it, every alternative is evaluated against the remaining planned suffix. This
-     * avoids the old one-tick controller replacing a valid neo/long-jump trajectory with a
-     * locally attractive correction that could not land.
-     */
-    private ControlFrame runtimeAirborneControl(ParkourState observed, ControlFrame planned,
-                                                int controlIndex) {
-        TrajectorySample expected = expectedSample(controlIndex);
-        ControlFrame nominal = airborneFrame(planned.forward(), planned.strafe(), planned.sprint(),
-                planned.desiredYaw());
-        boolean obstacleThreat = observed.horizontalCollision()
-                || bodyObstacleClearance(observed) < OBSTACLE_RECOVERY_CLEARANCE;
-        if (!requiresAirborneRecovery(observed, expected) && !obstacleThreat) {
-            airborneMismatchTicks = 0;
-            return nominal;
-        }
-        if (obstacleThreat) {
-            airborneMismatchTicks = 0;
-            return selectAirborneControl(observed, planned, controlIndex, true);
-        }
-        airborneMismatchTicks++;
-        if (airborneMismatchTicks < 2 && !requiresImmediateAirborneRecovery(observed, expected)) {
-            return nominal;
-        }
-        return selectAirborneControl(observed, planned, controlIndex);
-    }
-
-    ControlFrame selectAirborneControl(ParkourState observed, ControlFrame planned, int controlIndex) {
-        return selectAirborneControl(observed, planned, controlIndex, false);
-    }
-
-    private ControlFrame selectAirborneControl(ParkourState observed, ControlFrame planned,
-                                               int controlIndex, boolean force) {
-        TrajectorySample expected = plan.predictedTrajectory().get(Math.min(
-                Math.max(0, controlIndex), plan.predictedTrajectory().size() - 1));
-        ControlFrame nominal = airborneFrame(planned.forward(), planned.strafe(), planned.sprint(),
-                planned.desiredYaw());
-        if (!force && !requiresAirborneRecovery(observed, expected)) return nominal;
-
-        List<ControlFrame> choices = List.of(nominal,
-                airborneFrame(0, 0, false, nominal.desiredYaw()),
-                airborneFrame(-1, 0, false, nominal.desiredYaw()),
-                airborneFrame(nominal.forward(), -1, nominal.sprint(), nominal.desiredYaw()),
-                airborneFrame(nominal.forward(), 1, nominal.sprint(), nominal.desiredYaw()));
-        RecoveryOutcome plannedOutcome = force
-                ? twoTickRecoveryScore(observed, choices.getFirst(), controlIndex, 0)
-                : recoveryScore(observed, choices.getFirst(), controlIndex, 0);
-        ControlFrame best = choices.getFirst();
-        double bestScore = plannedOutcome.score();
-        for (int index = 1; index < choices.size(); index++) {
-            ControlFrame choice = choices.get(index);
-            RecoveryOutcome outcome = force
-                    ? twoTickRecoveryScore(observed, choice, controlIndex, index)
-                    : recoveryScore(observed, choice, controlIndex, index);
-            if (outcome.score() < bestScore) { bestScore = outcome.score(); best = choice; }
-        }
-        return best;
-    }
-
-    /**
-     * Tight obstacle routes need a coordinated correction, not one alternate frame followed by
-     * the unchanged suffix. Evaluate one additional command and apply only the first result;
-     * this remains a small receding-horizon controller rather than an open-loop rewrite.
-     */
-    private RecoveryOutcome twoTickRecoveryScore(ParkourState start, ControlFrame first,
-                                                   int controlIndex, int preference) {
-        ParkourState afterFirst;
-        try { afterFirst = physics.tick(world, start, boundedInput(start, first)); }
-        catch (RuntimeException exception) { return new RecoveryOutcome(Double.MAX_VALUE, false); }
-        if (afterFirst.onGround()) return recoveryScore(start, first, controlIndex, preference);
-
-        ControlFrame nextPlanned = nextAirborneFrame(controlIndex + 1);
-        List<ControlFrame> secondChoices = List.of(nextPlanned,
-                airborneFrame(0, 0, false, nextPlanned.desiredYaw()),
-                airborneFrame(-1, 0, false, nextPlanned.desiredYaw()),
-                airborneFrame(nextPlanned.forward(), -1, nextPlanned.sprint(), nextPlanned.desiredYaw()),
-                airborneFrame(nextPlanned.forward(), 1, nextPlanned.sprint(), nextPlanned.desiredYaw()));
-        RecoveryOutcome best = new RecoveryOutcome(Double.MAX_VALUE, false);
-        for (int index = 0; index < secondChoices.size(); index++) {
-            RecoveryOutcome outcome = recoveryScore(afterFirst, secondChoices.get(index),
-                    controlIndex + 1, preference * 10 + index);
-            outcome = new RecoveryOutcome(outcome.score() + obstacleRisk(afterFirst),
-                    outcome.stableTarget());
-            if (outcome.score() < best.score()) best = outcome;
-        }
-        return best;
-    }
-
-    private ControlFrame nextAirborneFrame(int index) {
-        for (int cursor = Math.max(0, index); cursor < plan.controlFrames().size(); cursor++) {
-            ControlFrame frame = plan.controlFrames().get(cursor);
-            if (frame.phase() == ControlPhase.AIRBORNE) {
-                return airborneFrame(frame.forward(), frame.strafe(), frame.sprint(), frame.desiredYaw());
-            }
-        }
-        return airborneFrame(0, 0, false, plan.launchEnvelope().desiredYaw());
-    }
-
-    private RecoveryOutcome recoveryScore(ParkourState start, ControlFrame first,
-                                          int controlIndex, int preference) {
-        ParkourState state;
-        try { state = physics.tick(world, start, boundedInput(start, first)); }
-        catch (RuntimeException exception) { return new RecoveryOutcome(Double.MAX_VALUE, false); }
-        int cursor = Math.max(0, controlIndex + 1);
-        int groundedTargetTicks = 0;
-        int slowTargetTicks = 0;
-        double obstacleRisk = obstacleRisk(state);
-        double score = state.feetPosition().squaredDistanceTo(expectedSample(cursor).feetPosition()) * 0.25;
-        for (int tick = 0; tick < RECOVERY_HORIZON_TICKS; tick++) {
-            boolean target = SupportResolver.targetSupported(state.boundingBox(), state.feetPosition(),
-                    state.onGround(), plan.landingRegion());
-            if (state.onGround()) {
-                if (!target) return new RecoveryOutcome(1_000_000
-                        + SupportResolver.distanceToRegion(state.feetPosition(), plan.landingRegion()) * 1_000
-                        + preference, false);
-                groundedTargetTicks++;
-                if (state.velocity().horizontalLength() <= LandingStabilityTracker.MAX_FINAL_SPEED) {
-                    slowTargetTicks++;
-                } else slowTargetTicks = 0;
-                if (groundedTargetTicks >= LandingStabilityTracker.REQUIRED_GROUNDED_TICKS
-                        && slowTargetTicks >= LandingStabilityTracker.REQUIRED_SETTLE_TICKS) {
-                    double margin = SupportResolver.edgeMargin(state.boundingBox(), state.feetPosition().y,
-                            plan.landingRegion());
-                    return new RecoveryOutcome(-1_000_000 - margin * 1_000
-                            + state.velocity().horizontalLength() * 100 + preference + obstacleRisk, true);
-                }
-            }
-
-            ControlFrame continuation;
-            if (!state.onGround()) {
-                while (cursor < plan.controlFrames().size()
-                        && plan.controlFrames().get(cursor).phase() != ControlPhase.AIRBORNE) cursor++;
-                if (cursor < plan.controlFrames().size()) {
-                    ControlFrame suffix = plan.controlFrames().get(cursor++);
-                    continuation = airborneFrame(suffix.forward(), suffix.strafe(), suffix.sprint(),
-                            suffix.desiredYaw());
-                } else continuation = airborneFrame(0, 0, false, plan.launchEnvelope().desiredYaw());
-            } else {
-                while (cursor < plan.controlFrames().size()
-                        && !plan.controlFrames().get(cursor).phase().isLandingPhase()) cursor++;
-                if (cursor < plan.controlFrames().size()) continuation = plan.controlFrames().get(cursor++);
-                else continuation = projectedStoppingFrame(state);
-            }
-            try { state = physics.tick(world, state, boundedInput(state, continuation)); }
-            catch (RuntimeException exception) { return new RecoveryOutcome(Double.MAX_VALUE, false); }
-            obstacleRisk += obstacleRisk(state);
-            if (state.feetPosition().y < plan.settleAnchor().y - 4) {
-                return new RecoveryOutcome(2_000_000 + preference, false);
-            }
-        }
-        boolean target = SupportResolver.targetSupported(state.boundingBox(), state.feetPosition(),
-                state.onGround(), plan.landingRegion());
-        if (state.onGround() && !target) score += 1_000_000;
-        else if (target) {
-            score -= 100_000;
-            score -= SupportResolver.edgeMargin(state.boundingBox(), state.feetPosition().y,
-                    plan.landingRegion()) * 1_000;
-            score += state.velocity().horizontalLength() * 80;
-        } else score += SupportResolver.distanceToRegion(state.feetPosition(), plan.landingRegion()) * 500;
-        score += horizontalDistance(state.feetPosition(), plan.settleAnchor()) * 20 + preference * 0.01;
-        return new RecoveryOutcome(score + obstacleRisk, false);
-    }
-
-    private double obstacleRisk(ParkourState state) {
-        double clearance = bodyObstacleClearance(state);
-        return (state.horizontalCollision() ? 5_000 : 0)
-                + Math.max(0, 0.22 - clearance) * 2_000;
-    }
-
-    private double bodyObstacleClearance(ParkourState state) {
-        double minimum = 10;
-        for (var obstacle : world.collisionBoxes(state.boundingBox().expand(0.35))) {
-            if (obstacle.maxY <= state.feetPosition().y + 0.05
-                    || obstacle.minY >= state.boundingBox().maxY - 0.05) continue;
-            double dx = Math.max(0, Math.max(obstacle.minX - state.boundingBox().maxX,
-                    state.boundingBox().minX - obstacle.maxX));
-            double dz = Math.max(0, Math.max(obstacle.minZ - state.boundingBox().maxZ,
-                    state.boundingBox().minZ - obstacle.maxZ));
-            minimum = Math.min(minimum, Math.hypot(dx, dz));
-        }
-        return minimum;
-    }
-
-    private ControlFrame projectedStoppingFrame(ParkourState state) {
-        if (state.velocity().horizontalLength() <= LandingStabilityTracker.MAX_FINAL_SPEED) {
-            return landingFrame(0, 0, false, state.yaw());
-        }
-        Vec3d heading = plan.launchEnvelope().routeHeading();
-        Vec3d side = ControlInput.strafeDirection(heading);
-        Vec3d opposite = new Vec3d(state.velocity().x, 0, state.velocity().z).normalize().multiply(-1);
-        return landingFrame((float) MathHelper.clamp(opposite.dotProduct(heading), -1, 1),
-                (float) MathHelper.clamp(opposite.dotProduct(side), -1, 1), false, state.yaw());
-    }
-
-    private ControlInput boundedInput(ParkourState state, ControlFrame frame) {
-        float delta = MathHelper.wrapDegrees(frame.desiredYaw() - state.yaw());
-        float yaw = state.yaw() + MathHelper.clamp(delta, -MAX_YAW_CHANGE, MAX_YAW_CHANGE);
-        return new ControlInput(frame.forward(), frame.strafe(), frame.sprint(), frame.jump(),
-                frame.sneak() && state.onGround(), yaw);
-    }
-
-    private TrajectorySample expectedSample(int index) {
-        return plan.predictedTrajectory().get(Math.min(Math.max(0, index),
-                plan.predictedTrajectory().size() - 1));
-    }
-
     static boolean requiresAirborneRecovery(ParkourState observed, TrajectorySample expected) {
         Vec3d positionError = observed.feetPosition().subtract(expected.feetPosition());
         Vec3d velocityError = observed.velocity().subtract(expected.velocity());
@@ -657,87 +927,30 @@ public final class TrajectoryStepController implements StepController {
                 || Math.abs(positionError.y) > AIRBORNE_VERTICAL_POSITION_DEADBAND
                 || Math.abs(velocityError.y) > AIRBORNE_VERTICAL_VELOCITY_DEADBAND;
     }
-
-    private static boolean requiresImmediateAirborneRecovery(ParkourState observed,
-                                                              TrajectorySample expected) {
-        Vec3d positionError = observed.feetPosition().subtract(expected.feetPosition());
-        Vec3d velocityError = observed.velocity().subtract(expected.velocity());
-        return Math.hypot(positionError.x, positionError.z) > AIRBORNE_POSITION_DEADBAND * 2
-                || Math.hypot(velocityError.x, velocityError.z) > AIRBORNE_VELOCITY_DEADBAND * 2
-                || Math.abs(positionError.y) > AIRBORNE_VERTICAL_POSITION_DEADBAND * 2
-                || Math.abs(velocityError.y) > AIRBORNE_VERTICAL_VELOCITY_DEADBAND * 2;
-    }
-
-    private ControlFrame airborneFrame(float forward, float strafe, boolean sprint, float yaw) {
-        return new ControlFrame(forward, strafe, sprint, false, false, yaw,
-                ControlPhase.AIRBORNE, FrameGuard.AIRBORNE);
-    }
-
-    private ControlInput input(ControlFrame frame) {
-        return new ControlInput(frame.forward(), frame.strafe(), frame.sprint(), frame.jump(),
-                frame.sneak(), frame.desiredYaw());
-    }
-
-    private ControlFrame lastAirborneFrame() {
-        for (int index = Math.min(frameIndex, plan.controlFrames().size() - 1); index >= 0; index--) {
-            ControlFrame frame = plan.controlFrames().get(index);
-            if (frame.phase() == ControlPhase.AIRBORNE || frame.phase() == ControlPhase.TAKEOFF) {
-                return new ControlFrame(frame.forward(), frame.strafe(), frame.sprint(), false, false,
-                        frame.desiredYaw(), ControlPhase.AIRBORNE, FrameGuard.AIRBORNE);
-            }
-        }
-        return new ControlFrame(0, 0, false, false, false, plan.launchEnvelope().desiredYaw(),
-                ControlPhase.AIRBORNE, FrameGuard.AIRBORNE);
-    }
-
-    private void applyFrame(MinecraftClient client, PlayerEntity player, ControlFrame frame, boolean targetSupported) {
-        smoothYaw(player, frame.desiredYaw());
-        boolean sneak = isSneakAllowed(frame.phase(), player.isOnGround(), targetSupported, frame.sneak());
-        setMovement(client, frame.forward(), frame.strafe(), frame.sprint(), frame.jump(), sneak);
-    }
-
-    private boolean targetSupported(PlayerEntity player) {
-        return SupportResolver.targetSupported(player.getBoundingBox(), player.getPos(), player.isOnGround(),
-                plan.landingRegion());
-    }
-    private void smoothYaw(PlayerEntity player, float desiredYaw) {
-        float delta = MathHelper.wrapDegrees(desiredYaw - player.getYaw());
-        player.setYaw(player.getYaw() + MathHelper.clamp(delta, -MAX_YAW_CHANGE, MAX_YAW_CHANGE));
-    }
-    private void setMovement(MinecraftClient client, float forward, float strafe,
-                             boolean sprint, boolean jump, boolean sneak) {
-        client.options.forwardKey.setPressed(forward > 0.01);
-        client.options.backKey.setPressed(forward < -0.01);
-        client.options.leftKey.setPressed(strafe > 0.01);
-        client.options.rightKey.setPressed(strafe < -0.01);
-        client.options.sprintKey.setPressed(sprint);
-        client.options.jumpKey.setPressed(jump);
-        client.options.sneakKey.setPressed(sneak);
-    }
-    private void release(MinecraftClient client) { setMovement(client, 0, 0, false, false, false); }
-    private StepTickResult fail(String message) { reason = message; return StepTickResult.FAILED; }
-    private StepTickResult replan(String message) { reason = message; return StepTickResult.REPLAN; }
-    private Vec3d direction(float yaw) {
-        double radians = Math.toRadians(yaw);
-        return new Vec3d(-Math.sin(radians), 0, Math.cos(radians));
-    }
-    private double horizontalDistance(Vec3d a, Vec3d b) { return Math.hypot(a.x - b.x, a.z - b.z); }
-
     static boolean isSneakAllowed(ControlPhase phase, boolean onGround,
                                   boolean targetSupported, boolean requested) {
         return requested && phase.isLandingPhase() && onGround && targetSupported;
     }
     static boolean isLaunchYawAligned(float yawError) { return Math.abs(yawError) <= 2; }
+
     @Override
     public void stop(MinecraftClient client) {
-        if (client != null && client.options != null) release(client);
+        movementIO.release(client);
         plan = null;
+        world = null;
         landingTracker = null;
+        pending = null;
     }
-    @Override public String reason() { return reason.isBlank() ? StepController.super.reason() : reason; }
+    @Override public String reason() {
+        return reason.isBlank() ? StepController.super.reason() : reason;
+    }
 
-    private record LandingOutcome(ControlFrame frame, int supportedTicks,
-                                  double finalSpeed, int preference) {}
-    private record RecoveryOutcome(double score, boolean stableTarget) {}
-    enum TakeoffDecision { JUMP_NOW, APPROACH, ABORT }
+    ControllerPhase phase() { return phase; }
+    int controlIndex() { return controlIndex; }
+    boolean commandPending() { return pending != null; }
+    private StepTickResult fail(String message) { reason = message; return StepTickResult.FAILED; }
+    private StepTickResult replan(String message) { reason = message; return StepTickResult.REPLAN; }
+
+    private record PendingCommand(long epoch, ControlFrame frame, PhysicsStep expected,
+                                  int planIndex, boolean advancePlan, boolean jump) {}
 }

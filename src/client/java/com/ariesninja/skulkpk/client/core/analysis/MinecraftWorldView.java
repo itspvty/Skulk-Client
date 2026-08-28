@@ -13,9 +13,37 @@ import java.util.ArrayList;
 import java.util.List;
 
 public final class MinecraftWorldView implements WorldView {
+    private static final Cell AIR = new Cell(List.of(), false, true, false, false, false, 0.6F, 1);
     private final World world;
 
     public MinecraftWorldView(World world) { this.world = world; }
+    @Override public Cell captureCell(BlockPos pos) {
+        if (!world.isChunkLoaded(pos.getX() >> 4, pos.getZ() >> 4))
+            throw new IllegalArgumentException("Planning region includes unloaded chunks.");
+        BlockState state = world.getBlockState(pos);
+        if (state.isAir()) return AIR;
+        return new Cell(state.getCollisionShape(world, pos, ShapeContext.absent())
+                .getBoundingBoxes().stream().map(box -> box.offset(pos)).toList(),
+                state.isSolidBlock(world, pos), state.isAir(), state.getBlock() instanceof LadderBlock,
+                state.isIn(net.minecraft.registry.tag.BlockTags.CLIMBABLE), !state.getFluidState().isEmpty(),
+                state.getBlock().getSlipperiness(), state.getBlock().getJumpVelocityMultiplier());
+    }
+
+    /** Includes movement properties/fluid/ladder changes, not only visible collision boxes. */
+    @Override public long fingerprint(Box region) {
+        region = region.expand(1); // Includes the captured property/neighbor-shape halo.
+        // Keep shape hashing as well: moving-piston/block-entity collision can change
+        // without the block-state id changing.
+        long hash = WorldView.super.fingerprint(region);
+        BlockPos.Mutable pos = new BlockPos.Mutable();
+        for (int x = (int) Math.floor(region.minX); x < Math.ceil(region.maxX); x++)
+            for (int y = (int) Math.floor(region.minY); y < Math.ceil(region.maxY); y++)
+                for (int z = (int) Math.floor(region.minZ); z < Math.ceil(region.maxZ); z++) {
+                    hash = (hash ^ net.minecraft.block.Block.getRawIdFromState(
+                            world.getBlockState(pos.set(x, y, z)))) * 0x100000001b3L;
+                }
+        return hash;
+    }
     @Override public boolean isSolid(BlockPos pos) { return world.getBlockState(pos).isSolidBlock(world, pos); }
     @Override public boolean isAir(BlockPos pos) { return world.getBlockState(pos).isAir(); }
     @Override public boolean isLadder(BlockPos pos) { return world.getBlockState(pos).getBlock() instanceof LadderBlock; }
@@ -31,22 +59,7 @@ public final class MinecraftWorldView implements WorldView {
 
     @Override
     public List<StandableSurface> standableSurfaces(BlockPos pos) {
-        BlockState state = world.getBlockState(pos);
-        if (state.isAir()) return List.of();
-        VoxelShape shape = state.getCollisionShape(world, pos, ShapeContext.absent());
-        List<StandableSurface> surfaces = new ArrayList<>();
-        for (Box local : shape.getBoundingBoxes()) {
-            Box worldBox = local.offset(pos);
-            double top = worldBox.maxY;
-            if (worldBox.getLengthX() < 0.2 || worldBox.getLengthZ() < 0.2) continue;
-            Box body = new Box(
-                    (worldBox.minX + worldBox.maxX) * 0.5 - 0.3, top,
-                    (worldBox.minZ + worldBox.maxZ) * 0.5 - 0.3,
-                    (worldBox.minX + worldBox.maxX) * 0.5 + 0.3, top + 1.8,
-                    (worldBox.minZ + worldBox.maxZ) * 0.5 + 0.3);
-            if (!hasCollision(body)) surfaces.add(new StandableSurface(pos, worldBox, top));
-        }
-        return List.copyOf(surfaces);
+        return SupportGeometry.surfaces(this, pos, captureCell(pos).collisions());
     }
 
     @Override public double slipperiness(BlockPos pos) { return world.getBlockState(pos).getBlock().getSlipperiness(); }

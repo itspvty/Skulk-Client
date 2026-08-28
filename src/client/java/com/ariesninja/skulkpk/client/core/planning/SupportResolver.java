@@ -14,7 +14,7 @@ public final class SupportResolver {
 
     private SupportResolver() {}
 
-    public record Contact(SupportKind kind, double overlapArea, double edgeMargin) {
+    public record Contact(SupportKind kind, double overlapArea) {
         public boolean targetSupported() { return kind == SupportKind.TARGET; }
     }
 
@@ -22,20 +22,20 @@ public final class SupportResolver {
                                   List<StandableSurface> target,
                                   List<StandableSurface> takeoff,
                                   WorldView world) {
-        if (!onGround) return new Contact(SupportKind.NONE, 0, -1);
+        if (!onGround) return new Contact(SupportKind.NONE, 0);
         double targetOverlap = overlapArea(playerBox, feet.y, target);
         if (targetOverlap > MINIMUM_OVERLAP) {
-            return new Contact(SupportKind.TARGET, targetOverlap, edgeMargin(playerBox, feet.y, target));
+            return new Contact(SupportKind.TARGET, targetOverlap);
         }
         double takeoffOverlap = overlapArea(playerBox, feet.y, takeoff);
         if (takeoffOverlap > MINIMUM_OVERLAP) {
-            return new Contact(SupportKind.TAKEOFF, takeoffOverlap, edgeMargin(playerBox, feet.y, takeoff));
+            return new Contact(SupportKind.TAKEOFF, takeoffOverlap);
         }
         Box below = new Box(playerBox.minX, playerBox.minY - 0.08, playerBox.minZ,
                 playerBox.maxX, playerBox.minY + 0.02, playerBox.maxZ);
         return world != null && !world.collisionBoxes(below).isEmpty()
-                ? new Contact(SupportKind.OTHER, 0, -1)
-                : new Contact(SupportKind.NONE, 0, -1);
+                ? new Contact(SupportKind.OTHER, 0)
+                : new Contact(SupportKind.NONE, 0);
     }
 
     public static double overlapArea(Box playerBox, double feetY, List<StandableSurface> region) {

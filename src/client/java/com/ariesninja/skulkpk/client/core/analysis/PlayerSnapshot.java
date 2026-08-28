@@ -21,7 +21,11 @@ public record PlayerSnapshot(
         double jumpStrength,
         double stepHeight,
         double gravity,
-        Map<String, EffectSnapshot> activeEffects
+        Map<String, EffectSnapshot> activeEffects,
+        double sneakingSpeed,
+        int sprintTapTicks,
+        boolean previousForward,
+        boolean sprintAllowed
 ) {
     public record EffectSnapshot(int amplifier, int remainingTicks) {}
     public PlayerSnapshot {
@@ -54,8 +58,41 @@ public record PlayerSnapshot(
         return new PlayerSnapshot(
                 player.getPos(), player.getBoundingBox(), player.getVelocity(), player.getYaw(),
                 player.isOnGround(), player.isSprinting(), player.isSneaking(),
-                player.getMovementSpeed(), player.getAttributeValue(EntityAttributes.JUMP_STRENGTH),
-                player.getStepHeight(), player.getAttributeValue(EntityAttributes.GRAVITY), effects);
+                player.getAttributeValue(EntityAttributes.MOVEMENT_SPEED),
+                player.getAttributeValue(EntityAttributes.JUMP_STRENGTH),
+                player.getStepHeight(), player.getAttributeValue(EntityAttributes.GRAVITY), effects,
+                player.getAttributeValue(EntityAttributes.SNEAKING_SPEED),
+                player instanceof net.minecraft.client.network.ClientPlayerEntity client
+                        ? client.ticksLeftToDoubleTapSprint : 0,
+                player instanceof net.minecraft.client.network.ClientPlayerEntity client
+                        && client.input.movementForward >= 0.8F,
+                player.getHungerManager().getFoodLevel() > 6 || player.getAbilities().allowFlying);
+    }
+
+    public PlayerSnapshot(Vec3d feetPosition, Box boundingBox, Vec3d velocity, float yaw,
+                          boolean onGround, boolean sprinting, boolean sneaking, double movementSpeed,
+                          double jumpStrength, double stepHeight, double gravity,
+                          Map<String, EffectSnapshot> activeEffects, double sneakingSpeed,
+                          int sprintTapTicks, boolean previousForward) {
+        this(feetPosition, boundingBox, velocity, yaw, onGround, sprinting, sneaking,
+                movementSpeed, jumpStrength, stepHeight, gravity, activeEffects, sneakingSpeed,
+                sprintTapTicks, previousForward, true);
+    }
+
+    public PlayerSnapshot(Vec3d feetPosition, Box boundingBox, Vec3d velocity, float yaw,
+                          boolean onGround, boolean sprinting, boolean sneaking, double movementSpeed,
+                          double jumpStrength, double stepHeight, double gravity,
+                          Map<String, EffectSnapshot> activeEffects, double sneakingSpeed) {
+        this(feetPosition, boundingBox, velocity, yaw, onGround, sprinting, sneaking,
+                movementSpeed, jumpStrength, stepHeight, gravity, activeEffects, sneakingSpeed, 0, false);
+    }
+
+    public PlayerSnapshot(Vec3d feetPosition, Box boundingBox, Vec3d velocity, float yaw,
+                          boolean onGround, boolean sprinting, boolean sneaking, double movementSpeed,
+                          double jumpStrength, double stepHeight, double gravity,
+                          Map<String, EffectSnapshot> activeEffects) {
+        this(feetPosition, boundingBox, velocity, yaw, onGround, sprinting, sneaking,
+                movementSpeed, jumpStrength, stepHeight, gravity, activeEffects, 0.3);
     }
 
     public Vec3d position() { return feetPosition; }

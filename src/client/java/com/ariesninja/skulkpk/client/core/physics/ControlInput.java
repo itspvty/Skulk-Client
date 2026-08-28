@@ -1,6 +1,5 @@
 package com.ariesninja.skulkpk.client.core.physics;
 
-import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 
 /** One immutable client input frame consumed by {@link ParkourPhysics}. */
@@ -13,8 +12,14 @@ public record ControlInput(
         float yaw
 ) {
     public ControlInput {
-        forward = MathHelper.clamp(forward, -1, 1);
-        strafe = MathHelper.clamp(strafe, -1, 1);
+        forward = keyAxis(forward);
+        strafe = keyAxis(strafe);
+    }
+
+    /** KeyboardInput has three states per axis; fractional steering is not executable. */
+    public static float keyAxis(float value) {
+        if (!Float.isFinite(value)) throw new IllegalArgumentException("Movement input must be finite.");
+        return value > 0.01f ? 1 : value < -0.01f ? -1 : 0;
     }
 
     public ControlInput withoutJump() {

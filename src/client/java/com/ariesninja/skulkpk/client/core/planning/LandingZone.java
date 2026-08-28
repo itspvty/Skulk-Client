@@ -2,6 +2,8 @@ package com.ariesninja.skulkpk.client.core.planning;
 
 import com.ariesninja.skulkpk.client.core.analysis.PlayerSnapshot;
 import com.ariesninja.skulkpk.client.core.analysis.StandableSurface;
+import com.ariesninja.skulkpk.client.core.analysis.SupportGeometry;
+import com.ariesninja.skulkpk.client.core.analysis.WorldView;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Vec3d;
 
@@ -29,6 +31,10 @@ public record LandingZone(
     }
 
     public static LandingZone build(List<StandableSurface> surfaces, PlayerSnapshot player) {
+        return build(surfaces, player, null);
+    }
+
+    public static LandingZone build(List<StandableSurface> surfaces, PlayerSnapshot player, WorldView world) {
         double width = player.boundingBox().getLengthX();
         double depth = player.boundingBox().getLengthZ();
         double height = player.boundingBox().getLengthY();
@@ -48,7 +54,26 @@ public record LandingZone(
                     addAnchor(all, surfaces, new Vec3d(x, surface.topY(), z), width, depth, height);
                 }
             }
+            if (world != null) {
+                for (Box region : SupportGeometry.standingRegions(world, surface, player.boundingBox())) {
+                    Vec3d center = new Vec3d((region.minX + region.maxX) / 2, surface.topY(),
+                            (region.minZ + region.maxZ) / 2);
+                    addAnchor(all, surfaces, center, width, depth, height);
+                    // A thin top may have no valid point on the normal block-center grid.
+                    for (double fraction : new double[]{0.25, 0.75}) {
+                        addAnchor(all, surfaces, new Vec3d(region.minX + region.getLengthX() * fraction,
+                                surface.topY(), center.z), width, depth, height);
+                        addAnchor(all, surfaces, new Vec3d(center.x, surface.topY(),
+                                region.minZ + region.getLengthZ() * fraction), width, depth, height);
+                    }
+                }
+            }
         }
+
+        if (world != null) all.removeIf(anchor -> !world.collisionBoxes(new Box(
+                anchor.feet().x - width / 2, anchor.feet().y + 1.0E-7, anchor.feet().z - depth / 2,
+                anchor.feet().x + width / 2, anchor.feet().y + height - 1.0E-7,
+                anchor.feet().z + depth / 2).contract(1.0E-7)).isEmpty());
 
         Map<String, LandingAnchor> unique = new LinkedHashMap<>();
         all.stream().sorted(ANCHOR_ORDER).forEach(anchor -> unique.putIfAbsent(key(anchor.feet()), anchor));

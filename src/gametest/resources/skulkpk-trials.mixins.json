@@ -1,0 +1,7 @@
+{
+  "required": true,
+  "package": "com.ariesninja.skulkpk.trials.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": ["PlayerTraceMixin", "MovementTraceMixin", "PlanTraceMixin", "SearchTraceMixin", "ExecutorTimingMixin"],
+  "injectors": {"defaultRequire": 1}
+}

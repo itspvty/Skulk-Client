@@ -34,6 +34,12 @@ class TrajectoryStepControllerPolicyTest {
         assertFalse(TrajectoryStepController.isLaunchYawAligned(90));
     }
 
+    @Test void takeoffCommandMustReachTheSimulatedHeadingWithinOneCameraUpdate() {
+        assertTrue(TrajectoryStepController.takeoffYawReachable(12));
+        assertFalse(TrajectoryStepController.takeoffYawReachable(12.01f));
+        assertFalse(TrajectoryStepController.takeoffYawReachable(14));
+    }
+
     @Test void launchUsesLaneRangesRatherThanOneExactStagingPoint() {
         LaunchEnvelope envelope = new LaunchEnvelope(new Box(-0.1, -0.05, -0.08, 0.12, 0.1, 0.08),
                 new Vec3d(0.08, 0, 0), 0.12, 0.04, -90, 4,
@@ -54,6 +60,28 @@ class TrajectoryStepControllerPolicyTest {
 
         assertTrue(envelope.containsPosition(new Vec3d(0, 0, -0.08)));
         assertFalse(envelope.containsPosition(new Vec3d(0, 0, 0.08)));
+    }
+
+    @Test void launchVelocityBoundaryAllowsMeasuredFloatNoiseButNotMeaningfulUnderspeed() {
+        Vec3d heading = new Vec3d(0.9971399047226776, 0, -0.07557784337786906);
+        Vec3d nominal = new Vec3d(0.15271998132363906, -0.0784000015258789, -0.011575359748422949);
+        double speed = nominal.dotProduct(heading);
+        var envelope = new LaunchEnvelope(new Box(1.4, -0.06, 0.3, 1.7, 0.18, 0.6), nominal,
+                0.1, 0.03, -94.33443f, 4, new Vec3d(1.5083466611, 0, 0.4386449452),
+                heading, -0.06, 0.1, -0.08, 0.08, speed, speed + 0.03);
+        // Observed at the final retained-ground command in the real four-block fixture.
+        assertTrue(envelope.containsVelocity(new Vec3d(0.1527172536741826,
+                -0.0784000015258789, -0.011570818259413253)));
+        assertFalse(envelope.containsVelocity(nominal.subtract(heading.multiply(0.00002))));
+        assertFalse(envelope.containsVelocity(nominal.subtract(heading.multiply(0.02))));
+    }
+
+    @Test void launchPositionBoundaryAllowsMeasuredFloatNoiseWithoutWideningTheTube() {
+        var envelope = new LaunchEnvelope(new Box(-0.1, -0.1, -0.1, 0.1, 0.1, 0.1),
+                Vec3d.ZERO, 0.025, 0.02, -90, 1.5f, Vec3d.ZERO, new Vec3d(1, 0, 0),
+                0, 0.025, -0.025, 0.025, 0, 0.02);
+        assertTrue(envelope.containsPosition(new Vec3d(-0.000008, 0, 0)));
+        assertFalse(envelope.containsPosition(new Vec3d(-0.00002, 0, 0)));
     }
 
     @Test void sneakIsImpossibleUntilActualTargetGroundSupport() {
@@ -115,7 +143,7 @@ class TrajectoryStepControllerPolicyTest {
         assertEquals(planned, controller.selectAirborneControl(observed, planned, 0));
     }
 
-    @Test void takeoffUsesAStableRolloutInsteadOfExactSampleError() {
+    @Test void takeoffUsesTheValidatedEnvelopeAndAtMostOneSafeApproachCommand() {
         InMemoryPhysicsWorld world = new InMemoryPhysicsWorld();
         java.util.List<com.ariesninja.skulkpk.client.core.analysis.StandableSurface> takeoffs =
                 new java.util.ArrayList<>();
@@ -163,5 +191,41 @@ class TrajectoryStepControllerPolicyTest {
                 controller.takeoffDecision(exact, jump, jumpIndex));
         assertNotEquals(TrajectoryStepController.TakeoffDecision.ABORT,
                 controller.takeoffDecision(lagged, jump, jumpIndex));
+    }
+
+    @Test void fringeLandingUsesBriefCounterInputThenNeutralRatherThanUnnecessarySneak() {
+        // Actual headhitter-back touchdown captured in normal Minecraft. Holding back
+        // forever falls off the near edge, but two braking commands stop safely.
+        Vec3d feet = new Vec3d(2.0807619646, 0, -0.2342114150);
+        Vec3d velocity = new Vec3d(0.2506460913, -0.0784000015, -0.0713073208);
+        Box box = new Box(feet.x - 0.3, 0, feet.z - 0.3, feet.x + 0.3, 1.8, feet.z + 0.3);
+        float yaw = -105.87595f;
+        var target = new com.ariesninja.skulkpk.client.core.analysis.StandableSurface(
+                new BlockPos(2, -1, 0), new Box(2, -1, 0, 3, 0, 1), 0);
+        var sample = new TrajectorySample(0, feet, velocity, box, true, false, true,
+                ControlPhase.LANDED_BRAKING, SupportKind.TARGET, 0.01);
+        var envelope = new LaunchEnvelope(box, velocity, 0.1, 0.1, yaw, 2);
+        var plan = new MovementPlan(java.util.List.of(), java.util.List.of(new ControlFrame(
+                0, 0, false, false, false, yaw, ControlPhase.SETTLING)), java.util.List.of(sample),
+                java.util.List.of(target), feet, feet, false, envelope,
+                new PlanMetrics(1, 1, 0, 0, 1, 0), 1, new Box(-1, -2, -2, 5, 4, 3));
+        var world = new InMemoryPhysicsWorld().floor(2, 0, 0);
+        var controller = new TrajectoryStepController();
+        controller.start(plan, world);
+        ParkourState state = new ParkourState(feet, velocity, box, yaw, true, true, true,
+                false, true, 10, 0.1, 0.42, 0.6, java.util.Map.of());
+        var physics = new com.ariesninja.skulkpk.client.core.physics.ParkourPhysics();
+        ControlFrame first = controller.selectLandingControl(state);
+        assertEquals(-1, first.forward());
+        assertFalse(first.sneak());
+        for (int tick = 0; tick < 40; tick++) {
+            ControlFrame control = controller.selectLandingControl(state);
+            assertFalse(control.sneak(), "No-sneak stopping remains supported at tick " + tick);
+            state = physics.tick(world, state, new com.ariesninja.skulkpk.client.core.physics.ControlInput(
+                    control.forward(), control.strafe(), false, false, control.sneak(), yaw)).state();
+            assertTrue(com.ariesninja.skulkpk.client.core.planning.SupportResolver.targetSupported(
+                    state.boundingBox(), state.feetPosition(), state.onGround(), java.util.List.of(target)));
+        }
+        assertEquals(0, state.velocity().horizontalLength(), 1.0E-9);
     }
 }

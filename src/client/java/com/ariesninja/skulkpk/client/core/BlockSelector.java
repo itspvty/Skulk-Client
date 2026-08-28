@@ -6,6 +6,7 @@ import com.ariesninja.skulkpk.client.core.analysis.MinecraftWorldView;
 import com.ariesninja.skulkpk.client.core.analysis.PlayerSnapshot;
 import com.ariesninja.skulkpk.client.core.rendering.SelectionRenderer;
 import com.ariesninja.skulkpk.client.core.utils.ChatMessageUtil;
+import com.ariesninja.skulkpk.client.core.utils.ModStateManager;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
@@ -19,12 +20,34 @@ public final class BlockSelector {
     private BlockSelector() {}
 
     public static void selectBlock(BlockHitResult hitResult, MinecraftClient client) {
-        if (hitResult == null || client.player == null || client.world == null) return;
+        if (hitResult != null) selectBlock(hitResult.getBlockPos(), client);
+    }
 
+    /** The crosshair and coordinate command share validation and execution-state guards. */
+    public static boolean selectBlock(BlockPos target, MinecraftClient client) {
+        if (target == null || client == null || client.player == null || client.world == null) return false;
+        if (!ModStateManager.isModEnabled()) {
+            ChatMessageUtil.sendWarn(client, "Skulk is disabled.");
+            return false;
+        }
+        StepExecutor executor = StepExecutor.getInstance();
+        if (executor.isPlanning()) {
+            executor.cancel(client, "Planning cancelled for a new selection.");
+        } else if (executor.isExecuting()) {
+            ChatMessageUtil.sendWarn(client, "Cancel the active jump before selecting another target.");
+            return false;
+        }
+        if (!client.world.isInBuildLimit(target) || !client.world.isPosLoaded(target)) {
+            clearSelectionSilent();
+            ChatMessageUtil.sendError(client, "The target must be inside the world bounds and in a loaded chunk.");
+            return false;
+        }
+
+        SelectionRenderer.clearMovementPlan();
         JumpProblemResult result = ANALYZER.analyzeProblem(
                 new MinecraftWorldView(client.world),
                 PlayerSnapshot.capture(client.player),
-                hitResult.getBlockPos());
+                target.toImmutable());
         storeProblemResult(result);
 
         if (result instanceof JumpProblemResult.Valid valid) {
@@ -34,6 +57,7 @@ public final class BlockSelector {
             SelectionRenderer.hideAllHighlights();
             ChatMessageUtil.sendError(client, rejected.message());
         }
+        return result instanceof JumpProblemResult.Valid;
     }
 
     static void storeProblemResult(JumpProblemResult result) {
