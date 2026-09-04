@@ -4,6 +4,8 @@ public enum ControlPhase {
     POSITIONING,
     ALIGNING,
     RUN_UP,
+    PREPARATORY_TAKEOFF,
+    APPROACH_AIRBORNE,
     TAKEOFF,
     AIRBORNE,
     LADDER,
@@ -15,5 +17,11 @@ public enum ControlPhase {
         return this == LANDED_BRAKING || this == SETTLING;
     }
 
-    public boolean isTransitPhase() { return this == AIRBORNE || this == LADDER || this == LADDER_EXIT; }
+    public boolean isTransitPhase() {
+        return this == AIRBORNE || this == LADDER || this == LADDER_EXIT;
+    }
+
+    public boolean isPreparatoryPhase() {
+        return this == PREPARATORY_TAKEOFF || this == APPROACH_AIRBORNE;
+    }
 }

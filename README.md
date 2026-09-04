@@ -9,6 +9,10 @@ Skulk is a Minecraft 1.21.4 Fabric client mod that analyzes a selected parkour l
 - `H` plans and executes the current valid selection.
 - `C` cancels execution and clears the selection.
 
+A new keyboard press during planning or execution cancels the jump and releases its
+movement inputs. Mouse movement does not cancel it. The initial `H` press, its key repeat,
+and key releases do not cancel the jump; a fresh `H`/`G` press cancels without restarting it.
+
 Selecting a new target cancels planning; selection is refused once movement has begun. Cancelling, disconnecting, disabling the mod, invalidating world geometry, failing execution, or timing out releases every movement input.
 
 The coordinate command runs entirely on the client and needs no server commands or operator permission. It performs the same analysis as `G`; invalid or unloaded targets clear the previous selection. Selection does not start movement: close chat and press `H` to plan/execute, or `C` to clear. `/skulk` displays usage.

@@ -94,9 +94,15 @@ public final class TrajectoryStepController implements StepController {
         ladderColumns = plan.routeMode() == RouteMode.LADDER_ASSIST
                 ? LadderColumn.discover(world, plan.fingerprintRegion().contract(0.01)) : List.of();
         landingTracker = new LandingStabilityTracker(plan.landingRegion());
-        jumpIndex = 0;
-        while (jumpIndex < plan.controlFrames().size()
-                && !plan.controlFrames().get(jumpIndex).jump()) jumpIndex++;
+        jumpIndex = plan.approachPlan().commitIndex();
+        if (jumpIndex < 0 || jumpIndex >= plan.controlFrames().size()
+                || !plan.controlFrames().get(jumpIndex).jump()) {
+            // Compatibility fallback for plans produced before the explicit final-commit
+            // contract. New plans may contain an earlier preparatory jump.
+            jumpIndex = 0;
+            while (jumpIndex < plan.controlFrames().size()
+                    && !plan.controlFrames().get(jumpIndex).jump()) jumpIndex++;
+        }
         controlIndex = 0;
         phase = plan.immediateLaunch() ? ControllerPhase.APPROACH_TRACKING : ControllerPhase.STAGING;
         pending = null;
@@ -151,7 +157,7 @@ public final class TrajectoryStepController implements StepController {
         matchContacts(command, observed);
         if (isAvoidanceRoute() && (observed.horizontalCollision()
                 || command.expected.collisions().contacts().stream()
-                    .anyMatch(contact -> !contact.support()))) {
+                    .anyMatch(contact -> !contact.support() && !contact.face().headContact()))) {
             movementIO.release(client);
             String features = command.expected.collisions().contacts().stream()
                     .filter(contact -> !contact.support())
@@ -270,37 +276,48 @@ public final class TrajectoryStepController implements StepController {
                 return tickStaging(state, client);
             }
         }
-        if (!state.onGround() || support(state) != SupportKind.TAKEOFF
-                && !retainedGroundCommit(state, controlIndex)) {
-            movementIO.release(client);
-            return fail("The approach lost support before takeoff commitment; automatic replanning was refused.");
-        }
         if (controlIndex >= plan.controlFrames().size() || jumpIndex >= plan.controlFrames().size()) {
             movementIO.release(client);
             return fail("The plan contains no executable jump transition.");
         }
         if (controlIndex < jumpIndex) {
+            ControlFrame approach = plan.controlFrames().get(controlIndex);
+            boolean ladder = !state.onGround() && ladderAttached(state);
+            if (!approach.guard().permits(state.onGround(), targetSupported(state), ladder)) {
+                movementIO.release(client);
+                return replan("The observed approach phase no longer matches its guarded state tube.");
+            }
+            if (state.onGround() && support(state) != SupportKind.TAKEOFF
+                    && !retainedGroundCommit(state, controlIndex)) {
+                movementIO.release(client);
+                return fail("The approach lost support before takeoff commitment; automatic replanning was refused.");
+            }
             TrajectorySample expected = expectedSample(controlIndex);
-            if (horizontalDistance(state.feetPosition(), expected.feetPosition())
-                    > PRECOMMIT_POSITION_LIMIT
-                    || state.velocity().subtract(expected.velocity()).horizontalLength()
-                    > PRECOMMIT_VELOCITY_LIMIT) {
+            if (state.feetPosition().distanceTo(expected.feetPosition()) > PRECOMMIT_POSITION_LIMIT
+                    || state.velocity().subtract(expected.velocity()).length() > PRECOMMIT_VELOCITY_LIMIT) {
                 movementIO.release(client);
                 return replan("The observed approach state left its validated state tube.");
             }
-            ControlFrame approach = plan.controlFrames().get(controlIndex);
             ParkourState next;
             try { next = physics.tickState(world, state, input(state, approach)); }
             catch (RuntimeException exception) {
                 movementIO.release(client);
                 return replan("The next approach command left the captured physics region.");
             }
-            if (!next.onGround() || support(next) != SupportKind.TAKEOFF
-                    && !retainedGroundCommit(next, controlIndex + 1)) {
-                // Validate departure AND the following jump as a pair before spending the last
-                // supported command. Never discover a missed launch tube after walking off.
+            int nextIndex = controlIndex + 1;
+            ControlFrame nextFrame = nextIndex < plan.controlFrames().size()
+                    ? plan.controlFrames().get(nextIndex) : null;
+            boolean nextLadder = !next.onGround() && ladderAttached(next);
+            boolean phaseMatches = nextFrame == null || nextFrame.guard().permits(next.onGround(),
+                    targetSupported(next), nextLadder);
+            boolean groundSafe = !next.onGround() || support(next) == SupportKind.TAKEOFF
+                    || retainedGroundCommit(next, nextIndex);
+            if (!phaseMatches || !groundSafe) {
+                // Validate departure and its following guarded state before spending the last
+                // supported command. This applies equally to a preparatory takeoff and the
+                // final zero-ground-tick commit.
                 movementIO.release(client);
-                return replan("Stopped before the edge: the next approach command would miss the validated jump state.");
+                return replan("Stopped before the edge: the next approach command would leave its validated state tube.");
             }
             return issue(state, approach, controlIndex, true, client);
         }
@@ -561,6 +578,75 @@ public final class TrajectoryStepController implements StepController {
     }
 
     private List<ParkourState> replayStagingRoute(ParkourState initial, int firstFrame) {
+        boolean chainedPlan = plan.controlFrames().subList(0,
+                Math.min(jumpIndex, plan.controlFrames().size())).stream()
+                .anyMatch(value -> value.phase().isPreparatoryPhase());
+        if (!chainedPlan) return replayOrdinaryStagingRoute(initial, firstFrame);
+        if (support(initial) != SupportKind.TAKEOFF
+                && !(firstFrame == jumpIndex && initial.onGround()
+                    && expectedSample(jumpIndex).support() == SupportKind.NONE)
+                || world.collisionBoxes(initial.boundingBox()).stream().anyMatch(initial.boundingBox()::intersects))
+            return null;
+        ParkourState state = initial;
+        boolean finalAirborne = firstFrame > jumpIndex && !state.onGround();
+        Set<String> required = new LinkedHashSet<>();
+        java.util.ArrayList<ParkourState> states = new java.util.ArrayList<>();
+        states.add(state);
+        for (int tick = firstFrame; tick < plan.controlFrames().size(); tick++) {
+            ControlFrame frame = plan.controlFrames().get(tick);
+            // A nearby validated staging state may touch the target one tick before the
+            // nominal flight cursor. Consuming an airborne command from grounded target
+            // support is unsafe; skip it and let the landing controller prove stability.
+            if (frame.guard() == FrameGuard.AIRBORNE && targetSupported(state)) continue;
+            boolean ladderAttached = !state.onGround() && ladderAttached(state);
+            if (tick < jumpIndex
+                    && !frame.guard().permits(state.onGround(), targetSupported(state), ladderAttached)) return null;
+            LadderColumn column = attachedColumn(state);
+            if (column != null) frame = LadderContinuation.choose(world, physics, state, column,
+                    column.exit(plan.landingZone()));
+            ControlInput input = new ControlInput(frame.forward(), frame.strafe(), frame.sprint(),
+                    frame.jump() && (state.onGround() || ladderAttached(state)),
+                    frame.sneak() && (targetSupported(state) || frame.phase() == ControlPhase.LADDER && ladderAttached(state)),
+                    boundedYaw(state.yaw(), frame.desiredYaw()));
+            PhysicsStep step;
+            try { step = physics.tick(world, state, input); }
+            catch (RuntimeException exception) { return null; }
+            if (isAvoidanceRoute() && step.collisions().contacts().stream()
+                    .anyMatch(contact -> !contact.support() && !contact.face().headContact())) return null;
+            for (CollisionContact contact : step.collisions().contacts()) {
+                if (contact.support()) continue;
+                for (ContactEvent event : plan.contactEvents()) {
+                    if (event.requirement() == ContactRequirement.REQUIRED
+                            && tick >= event.earliestTick() && tick <= event.latestTick()
+                            && event.featureId().equals(contact.featureId())
+                            && sameNormalClass(event, contact)) {
+                        required.add(event.featureId() + ":" + event.face());
+                    }
+                }
+            }
+            state = step.state();
+            states.add(state);
+            if (tick < jumpIndex) {
+                if (state.onGround() && support(state) != SupportKind.TAKEOFF
+                        && !(tick + 1 == jumpIndex && expectedSample(jumpIndex).support() == SupportKind.NONE)) {
+                    return null;
+                }
+            } else {
+                finalAirborne |= !state.onGround();
+                if (finalAirborne && state.onGround() && !targetSupported(state)
+                        && ladderColumns.stream().noneMatch(value -> value.supportsExit(step.state()))) return null;
+            }
+        }
+        return finalAirborne && state.onGround() && targetSupported(state)
+                && plan.contactEvents().stream()
+                    .filter(event -> event.requirement() == ContactRequirement.REQUIRED)
+                    .allMatch(event -> required.contains(event.featureId() + ":" + event.face()))
+                && state.velocity().horizontalLength() <= LandingStabilityTracker.MAX_FINAL_SPEED
+                ? List.copyOf(states) : null;
+    }
+
+    /** Stable legacy replay for the ordinary single-takeoff fast path. */
+    private List<ParkourState> replayOrdinaryStagingRoute(ParkourState initial, int firstFrame) {
         if (support(initial) != SupportKind.TAKEOFF
                 && !(firstFrame == jumpIndex && initial.onGround()
                     && expectedSample(jumpIndex).support() == SupportKind.NONE)
@@ -578,20 +664,20 @@ public final class TrajectoryStepController implements StepController {
                     column.exit(plan.landingZone()));
             ControlInput input = new ControlInput(frame.forward(), frame.strafe(), frame.sprint(),
                     frame.jump() && (state.onGround() || ladderAttached(state)),
-                    frame.sneak() && (targetSupported(state) || frame.phase() == ControlPhase.LADDER && ladderAttached(state)),
+                    frame.sneak() && (targetSupported(state)
+                        || frame.phase() == ControlPhase.LADDER && ladderAttached(state)),
                     boundedYaw(state.yaw(), frame.desiredYaw()));
             PhysicsStep step;
             try { step = physics.tick(world, state, input); }
             catch (RuntimeException exception) { return null; }
             if (isAvoidanceRoute() && step.collisions().contacts().stream()
-                    .anyMatch(contact -> !contact.support())) return null;
+                    .anyMatch(contact -> !contact.support() && !contact.face().headContact())) return null;
             for (CollisionContact contact : step.collisions().contacts()) {
                 if (contact.support()) continue;
                 for (ContactEvent event : plan.contactEvents()) {
                     if (event.requirement() == ContactRequirement.REQUIRED
                             && tick >= event.earliestTick() && tick <= event.latestTick()
-                            && event.featureId().equals(contact.featureId())
-                            && sameNormalClass(event, contact)) {
+                            && event.featureId().equals(contact.featureId()) && sameNormalClass(event, contact)) {
                         required.add(event.featureId() + ":" + event.face());
                     }
                 }
@@ -606,8 +692,7 @@ public final class TrajectoryStepController implements StepController {
                     && ladderColumns.stream().noneMatch(value -> value.supportsExit(step.state()))) return null;
         }
         return airborne && state.onGround() && targetSupported(state)
-                && plan.contactEvents().stream()
-                    .filter(event -> event.requirement() == ContactRequirement.REQUIRED)
+                && plan.contactEvents().stream().filter(event -> event.requirement() == ContactRequirement.REQUIRED)
                     .allMatch(event -> required.contains(event.featureId() + ":" + event.face()))
                 && state.velocity().horizontalLength() <= LandingStabilityTracker.MAX_FINAL_SPEED
                 ? List.copyOf(states) : null;
@@ -676,7 +761,7 @@ public final class TrajectoryStepController implements StepController {
         try {
             PhysicsStep step = physics.tick(world, state, input(state, frame));
             return !isAvoidanceRoute() || step.collisions().contacts().stream()
-                    .noneMatch(contact -> !contact.support());
+                    .noneMatch(contact -> !contact.support() && !contact.face().headContact());
         } catch (RuntimeException exception) { return false; }
     }
 
@@ -690,7 +775,7 @@ public final class TrajectoryStepController implements StepController {
             try { step = physics.tick(world, state, input(state, frame)); }
             catch (RuntimeException exception) { return Double.MAX_VALUE; }
             if (isAvoidanceRoute() && step.collisions().contacts().stream()
-                    .anyMatch(contact -> !contact.support())) return Double.MAX_VALUE;
+                    .anyMatch(contact -> !contact.support() && !contact.face().headContact())) return Double.MAX_VALUE;
             state = step.state();
             if (state.onGround()) {
                 return targetSupported(state) ? -100_000
@@ -810,8 +895,11 @@ public final class TrajectoryStepController implements StepController {
     private ControlFrame guardedFrame(ParkourState state, ControlFrame frame,
                                       boolean targetSupported) {
         boolean ladder = frame.phase() == ControlPhase.LADDER && !state.onGround() && ladderAttached(state);
+        boolean preparatoryJump = frame.phase() == ControlPhase.PREPARATORY_TAKEOFF
+                && phase == ControllerPhase.APPROACH_TRACKING;
         return new ControlFrame(frame.forward(), frame.strafe(), frame.sprint(),
-                frame.jump() && (state.onGround() && phase == ControllerPhase.TAKEOFF_COMMITTED || ladder),
+                frame.jump() && (state.onGround()
+                    && (phase == ControllerPhase.TAKEOFF_COMMITTED || preparatoryJump) || ladder),
                 frame.allowsSneak(state.onGround(), targetSupported, ladder), boundedYaw(state.yaw(), frame.desiredYaw()),
                 frame.phase(), frame.guard());
     }

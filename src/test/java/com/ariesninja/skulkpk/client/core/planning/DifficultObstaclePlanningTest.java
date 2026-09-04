@@ -8,7 +8,7 @@ import java.util.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 class DifficultObstaclePlanningTest {
-    @Test void twoBlockDeepFullAndFloatingObstaclesUseValidatedPrecisionRoutes() {
+    @Test void twoBlockDeepFullAndFloatingObstaclesUseValidatedRobustRoutes() {
         for (boolean floating : List.of(false, true)) {
             InMemoryPhysicsWorld grid = new InMemoryPhysicsWorld();
             List<StandableSurface> approach = new ArrayList<>();
@@ -40,8 +40,10 @@ class DifficultObstaclePlanningTest {
                     "floating=" + floating + " result=" + result).plan();
             assertTrue(plan.routeMode() == RouteMode.AVOID_LEFT || plan.routeMode() == RouteMode.AVOID_RIGHT);
             assertEquals(8, plan.validatedToleranceVariants());
-            assertEquals(0.005, plan.launchEnvelope().maximumPositionError(), 1.0E-9);
-            assertEquals(0.003, plan.launchEnvelope().maximumVelocityError(), 1.0E-9);
+            // Standard validation is stronger than the precision-only fallback.  Either is a
+            // valid result, but the solver must never advertise a tube wider than it tested.
+            assertTrue(plan.launchEnvelope().maximumPositionError() <= 0.025 + 1.0E-9);
+            assertTrue(plan.launchEnvelope().maximumVelocityError() <= 0.02 + 1.0E-9);
             assertTrue(plan.controlFrames().stream().noneMatch(frame -> frame.sneak()
                     && !frame.phase().isLandingPhase()));
             assertEquals(SupportKind.TARGET, plan.predictedTrajectory().getLast().support());

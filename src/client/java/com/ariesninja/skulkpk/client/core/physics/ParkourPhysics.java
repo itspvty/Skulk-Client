@@ -40,8 +40,11 @@ public final class ParkourPhysics {
         }
 
         Vec3d velocity = zeroTiny(state.velocity());
-        boolean jumped = input.jump() && state.onGround() && !state.jumpUsed();
-        boolean jumpUsed = state.jumpUsed() || jumped;
+        // jumpUsed belongs to one airborne episode.  Keeping it latched forever made the
+        // otherwise-authoritative kernel incapable of modelling a momentum jump which lands
+        // and commits the actual gap jump on the next command epoch.
+        boolean jumpWasUsed = !state.onGround() && state.jumpUsed();
+        boolean jumped = input.jump() && state.onGround() && !jumpWasUsed;
         // ClientPlayerEntity computes shouldSlowDown before KeyboardInput.tick: the
         // preceding sneak command controls input scaling, but the new command holds ladders.
         // The client recomputes its input pose before movement. The physical box can remain
@@ -138,8 +141,9 @@ public final class ParkourPhysics {
                     movedBox.maxX, movedBox.minY + poseHeight, movedBox.maxZ);
             if (world.collisionBoxes(resized.contract(EPSILON)).isEmpty()) nextBox = resized;
         }
+        boolean nextJumpUsed = !onGround && (jumpWasUsed || jumped);
         ParkourState next = new ParkourState(feet, nextVelocity, nextBox, input.yaw(), onGround,
-                sprinting, jumpUsed, collision.xCollision() || collision.zCollision(),
+                sprinting, nextJumpUsed, collision.xCollision() || collision.zCollision(),
                 collision.yCollision(), state.elapsedTicks() + 1, state.baseMovementSpeed(),
                 state.jumpStrength(), state.stepHeight(), state.gravity(), tickEffects(state.activeEffects()),
                 input.sneak(), state.sneakingSpeed(), collision.xCollision() || collision.zCollision()

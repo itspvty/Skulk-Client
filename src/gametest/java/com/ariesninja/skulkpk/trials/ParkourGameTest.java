@@ -362,6 +362,28 @@ public final class ParkourGameTest implements FabricClientGameTest {
                 new Vec3d(0.68, FEET_Y, 1.5), 180, doubleObstacle.target(), false));
         result.add(new Case("double-neo-back", doubleObstacle.geometry(),
                 new Vec3d(0.5, FEET_Y, 2.4), 90, doubleObstacle.target(), false));
+        // Advanced route probes. Their names live only in the development harness; shipping
+        // planning receives ordinary collision geometry and selected coordinates.
+        result.add(new Case("triple-neo", List.of("fill 0 100 -4 0 100 7 stone",
+                "fill 0 101 -3 0 103 -1 stone"),
+                new Vec3d(0.5, FEET_Y, 6.5), 180, new BlockPos(0, 100, -4), false));
+        result.add(new Case("triple-neo-rotated", List.of("fill -7 100 0 4 100 0 stone",
+                "fill 1 101 0 3 103 0 stone"),
+                new Vec3d(-5.5, FEET_Y, 0.5), -90, new BlockPos(4, 100, 0), false));
+        result.add(new Case("diagonal-pillar", List.of("setblock 0 100 0 stone",
+                "fill 1 100 1 1 103 1 stone", "setblock 2 100 2 stone"),
+                new Vec3d(0.5, FEET_Y, 0.5), -45, new BlockPos(2, 100, 2), false));
+        result.add(new Case("diagonal-pillar-mirrored", List.of("setblock 0 100 0 stone",
+                "fill 1 100 -1 1 103 -1 stone", "setblock 2 100 -2 stone"),
+                new Vec3d(0.5, FEET_Y, 0.5), -135, new BlockPos(2, 100, -2), false));
+        result.add(new Case("ceiling-rise-skirt", List.of("fill -2 100 0 0 100 0 stone",
+                "fill -2 103 -3 1 103 3 stone", "fill 2 104 -3 3 104 3 stone",
+                "fill 2 101 0 2 103 0 stone", "setblock 3 101 0 stone"),
+                new Vec3d(-0.5, FEET_Y, 0.5), -90, new BlockPos(3, 101, 0), false));
+        result.add(new Case("ceiling-rise-skirt-mirrored", List.of("fill 0 100 -2 0 100 0 stone",
+                "fill -3 103 -2 3 103 1 stone", "fill -3 104 2 3 104 3 stone",
+                "fill 0 101 2 0 103 2 stone", "setblock 0 101 3 stone"),
+                new Vec3d(0.5, FEET_Y, -0.5), 0, new BlockPos(0, 101, 3), false));
         result.add(new Case("ladder-calibration", List.of("fill 2 100 0 3 100 0 stone",
                 "fill 3 101 0 3 106 0 stone", "fill 2 101 0 2 106 0 ladder[facing=west]"),
                 new Vec3d(2.5, FEET_Y, 0.5), -90, new BlockPos(3, 106, 0), true));

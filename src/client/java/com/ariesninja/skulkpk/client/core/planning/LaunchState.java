@@ -6,7 +6,7 @@ import net.minecraft.util.math.Vec3d;
 
 import java.util.List;
 
-/** A physically generated state immediately before the one allowed jump transition. */
+/** A physically generated state immediately before the committed gap-jump transition. */
 public record LaunchState(
         ParkourState initialState,
         ParkourState state,
@@ -28,5 +28,10 @@ public record LaunchState(
                        List<ControlInput> groundPrefix, boolean startsFromCurrentState) {
         this(initialState, state, lane, stagingPosition, runUpLength, jumpTick,
                 groundPrefix, startsFromCurrentState, RouteMode.DIRECT);
+    }
+
+    /** The prefix may contain a momentum jump, but always ends at a grounded final launch. */
+    public boolean chainedTakeoff() {
+        return groundPrefix.stream().anyMatch(ControlInput::jump);
     }
 }

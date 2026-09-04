@@ -278,6 +278,34 @@ class SearchPlanningSessionTest {
                 Math.abs(sample.feetPosition().x - 0.5) > 0.82));
     }
 
+    @Test void threeBlockObstacleCanUseAZeroGroundTickChainedTakeoff() {
+        InMemoryPhysicsWorld world = new InMemoryPhysicsWorld();
+        List<StandableSurface> approach = new ArrayList<>();
+        for (int z = 0; z <= 7; z++) {
+            world.floor(0, z, 0);
+            approach.add(surface(0, z, 0));
+        }
+        List<StandableSurface> landing = List.of(surface(0, -4, 0));
+        world.floor(0, -4, 0);
+        for (int z = -3; z <= -1; z++) world.box(new Box(0, 0, z, 1, 3, z + 1));
+
+        MovementPlan plan = ready(new SearchPlanningSession(customRequest(world,
+                List.of(surface(0, 0, 0)), approach, landing,
+                new Vec3d(0.5, 0, 6.5), 180, PlanningPolicy.AGGRESSIVE)));
+
+        assertEquals(PlanningStage.OBSTACLE, plan.planningStage());
+        long jumpCommands = plan.controlFrames().stream().filter(ControlFrame::jump).count();
+        assertEquals(2, jumpCommands, "A momentum jump and final gap jump must both be explicit.");
+        int finalCommit = plan.approachPlan().commitIndex();
+        int preparatory = java.util.stream.IntStream.range(0, finalCommit)
+                .filter(index -> plan.controlFrames().get(index).jump()).findFirst().orElseThrow();
+        assertEquals(ControlPhase.PREPARATORY_TAKEOFF,
+                plan.controlFrames().get(preparatory).phase());
+        assertEquals(FrameGuard.GROUNDED, plan.controlFrames().get(finalCommit).guard());
+        assertTrue(plan.predictedTrajectory().get(finalCommit).onGround());
+        assertEquals(SupportKind.TARGET, plan.predictedTrajectory().getLast().support());
+    }
+
     @Test void productionPhysicsRetainsAFullColumnAvoidanceHomotopy() {
         InMemoryPhysicsWorld world = new InMemoryPhysicsWorld();
         for (int z = 0; z <= 2; z++) world.floor(0, z, 0);

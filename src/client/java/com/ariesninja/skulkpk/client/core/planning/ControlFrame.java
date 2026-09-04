@@ -41,7 +41,7 @@ public record ControlFrame(
 
     private static FrameGuard defaultGuard(ControlPhase phase) {
         return switch (phase) {
-            case AIRBORNE -> FrameGuard.AIRBORNE;
+            case AIRBORNE, APPROACH_AIRBORNE -> FrameGuard.AIRBORNE;
             case LADDER -> FrameGuard.LADDER;
             case LANDED_BRAKING, SETTLING -> FrameGuard.TARGET_GROUNDED;
             default -> FrameGuard.GROUNDED;
